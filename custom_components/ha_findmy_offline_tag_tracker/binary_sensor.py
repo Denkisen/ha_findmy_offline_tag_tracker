@@ -1,79 +1,74 @@
-"""Binary sensor platform for FHN Tracker."""
+"""Binary sensor platform: tag in-range / out-of-range."""
+
+from __future__ import annotations
+
+from typing import Any
 
 from homeassistant.components.binary_sensor import (
-    BinarySensorEntity,
     BinarySensorDeviceClass,
+    BinarySensorEntity,
 )
-from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-)
-from datetime import datetime
-import logging
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
-from . import TagDevice, PRESENT_TIMEOUT_SECONDS
-
-_LOGGER = logging.getLogger(__name__)
+from .const import DOMAIN
+from .coordinator import TagCoordinator
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    async_add_entities,
-):
-    """Set up the FHN Tracker binary sensors."""
-    device: TagDevice = hass.data[entry.entry_id]["device"]
-
-    async def async_update_data():
-        return device
-
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        name="fhn_tracker_presence",
-        update_method=async_update_data,
-        update_interval=None,
-    )
-
-    async_add_entities([
-        PresenceSensor(device, coordinator),
-    ])
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    coordinator: TagCoordinator = entry.runtime_data
+    async_add_entities([LoshallTagPresence(entry, coordinator)])
 
 
-class PresenceSensor(CoordinatorEntity, BinarySensorEntity):
-    """Presence detection binary sensor."""
+class LoshallTagPresence(BinarySensorEntity, RestoreEntity):
+    """Reports whether the tag is currently in Bluetooth range."""
 
+    _attr_has_entity_name = True
+    _attr_name = "In Range"
     _attr_device_class = BinarySensorDeviceClass.PRESENCE
+    _attr_should_poll = False
 
-    def __init__(self, device: TagDevice, coordinator: DataUpdateCoordinator):
-        super().__init__(coordinator)
-        self.device = device
-        self._attr_has_entity_name = True
-        self._attr_unique_id = f"{device.beacon.model_id}_presence"
-        self._attr_translation_key = "presence"
+    def __init__(self, entry: ConfigEntry, coordinator: TagCoordinator) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
 
     @property
-    def is_on(self):
-        if self.device.last_seen is None:
-            return False
-        elapsed = (datetime.now() - self.device.last_seen).total_seconds()
-        return elapsed < PRESENT_TIMEOUT_SECONDS
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_presence"
 
     @property
-    def available(self):
-        return self.device.last_seen is not None
+    def device_info(self) -> DeviceInfo:
+        return self._coordinator.device_info
 
     @property
-    def extra_state_attributes(self):
-        attrs = {
-            "timeout_seconds": PRESENT_TIMEOUT_SECONDS,
-            "model_id": self.device.beacon.model_id,
-            "original_mac": self.device.beacon.original_mac,
+    def is_on(self) -> bool:
+        return self._coordinator.is_home
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        last_seen = self._coordinator.last_seen
+        return {
+            "last_seen": last_seen.isoformat() if last_seen else None,
+            "rssi": self._coordinator.rssi,
+            "address": self._coordinator.address,
         }
-        if self.device.last_rssi is not None:
-            attrs["rssi_dbm"] = self.device.last_rssi
-        if self.device.last_clock_skew_ticks is not None:
-            attrs["clock_skew_ticks"] = self.device.last_clock_skew_ticks
-        return attrs
+
+    async def async_added_to_hass(self) -> None:
+        # Restore the in-range flag from the last known state across restarts.
+        if (last_state := await self.async_get_last_state()) is not None:
+            self._coordinator.restore_is_home(last_state.state == "on")
+
+        self.async_on_remove(
+            self._coordinator.add_listener(self._async_write_state)
+        )
+
+    @callback
+    def _async_write_state(self) -> None:
+        self.async_write_ha_state()

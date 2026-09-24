@@ -1,39 +1,32 @@
 {
   "config": {
-    "step": {
-      "user": {
-        "title": "Set Up FindMy Tag",
-        "description": "{instructions}",
-        "data": {
-          "shared_secret": "Shared Secret",
-          "account_key": "Account Key",
-          "ephemeral_identity_key": "Ephemeral Identity Key",
-          "model_id": "Model ID (0x...)",
-          "original_mac": "Original MAC Address",
-          "clock_offset": "Clock Offset (seconds)"
-        }
-      }
+    "abort": {
+      "already_configured": "This tag is already configured."
     },
     "error": {
-      "invalid_keys": "Invalid key format. Check the values carefully.",
-      "unknown_error": "An unexpected error occurred."
+      "invalid_clock_offset": "Clock offset must be a number (e.g. 17000000.5).",
+      "invalid_eik": "Ephemeral Identity Key must be 40 or 64 hex characters (20 or 32 bytes).",
+      "name_required": "Name is required."
+    },
+    "step": {
+      "user": {
+        "data": {
+          "name": "Tag name",
+          "clock_offset": "Clock offset",
+          "curve": "EID curve",
+          "ephemeral_identity_key": "Ephemeral Identity Key (hex)"
+        },
+        "description": "Enter the key material printed when you provisioned the tag with fhn_provision.py."
+      }
     }
   },
-  "entity": {
-    "sensor": {
-      "rssi": {
-        "name": "RSSI"
-      },
-      "last_seen": {
-        "name": "Last Seen"
-      },
-      "clock_skew": {
-        "name": "Clock Skew"
-      }
-    },
-    "binary_sensor": {
-      "presence": {
-        "name": "Present"
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "presence_timeout": "Presence timeout (seconds)"
+        },
+        "description": "Mark the tag out of range if no advertisement is seen for this many seconds."
       }
     }
   }

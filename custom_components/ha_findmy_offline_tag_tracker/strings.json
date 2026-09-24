@@ -1,0 +1,33 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "This tag is already configured."
+    },
+    "error": {
+      "invalid_clock_offset": "Clock offset must be a number (e.g. 17000000.5).",
+      "invalid_eik": "Ephemeral Identity Key must be 40 or 64 hex characters (20 or 32 bytes).",
+      "name_required": "Name is required."
+    },
+    "step": {
+      "user": {
+        "data": {
+          "name": "Tag name",
+          "clock_offset": "Clock offset",
+          "curve": "EID curve",
+          "ephemeral_identity_key": "Ephemeral Identity Key (hex)"
+        },
+        "description": "Enter the key material printed when you provisioned the tag with fhn_provision.py."
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "presence_timeout": "Presence timeout (seconds)"
+        },
+        "description": "Mark the tag out of range if no advertisement is seen for this many seconds."
+      }
+    }
+  }
+}

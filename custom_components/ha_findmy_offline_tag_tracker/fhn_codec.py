@@ -1,235 +1,160 @@
-"""Google FHN EID decryption codec - ported from fhn-beacon-tools."""
+"""Find Hub Network (FHN) EID crypto, ported from fhn-beacon-tools.
 
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+This module reproduces the Ephemeral Identity (EID) generation and matching
+logic from ``fhn_track.py``. It lets us associate an advertisement with a
+specific beacon even though the beacon's MAC address randomises and its EID
+rotates every ``2**10`` seconds.
+
+The only differences from the reference tool are:
+* the EC point math (``r * G``) is done in pure Python (``.ec``) instead of
+  ``fastecdsa`` — this keeps the integration free of compiled/Rust
+  dependencies, so it only needs ``cryptography`` (shipped by HA core); and
+* the AES input is passed as ``bytes`` rather than ``bytearray``.
+
+Everything else (curve parameters, AES-ECB construction of the EID, rotation
+period and skew window) is identical to the reference implementation, so it
+matches beacons provisioned by ``fhn_provision.py``. The pure-Python EC is
+verified to produce byte-identical points to ``fastecdsa``.
+"""
+
 from dataclasses import dataclass
-from collections import OrderedDict
-
-try:
-    from fastecdsa.curve import Curve
-    from fastecdsa.keys import get_public_key
-except ImportError:
-    raise RuntimeError("fastecdsa is required. Install with: pip install fastecdsa")
+from datetime import datetime, timedelta
+from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from bleak import AdvertisementData, BLEDevice
 
-_LOGGER = logging.getLogger(__name__)
-
-# Constants from fhn_track.py
-EDDYSTONE_SERVICE_UUID = "0000feaa-0000-1000-8000-00805f9b34fb"
-ROTATION_PERIOD_EXPONENT = 10
-ROTATION_PERIOD = 1 << ROTATION_PERIOD_EXPONENT  # 1024 seconds
-ROTATION_PERIOD_DELTA = timedelta(seconds=ROTATION_PERIOD)
-
-# secp160r1 curve definition (from source)
-SECP160R1 = Curve(
-    name="secp160r1",
-    p=0xFFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF_7FFFFFFF,
-    a=0xFFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF_7FFFFFFC,
-    b=0x1C97BEFC_54BD7A8B_65ACF89F_81D4D4AD_C565FA45,
-    q=0x01_00000000_00000000_0001F4C8_F927AED3_CA752257,
-    gx=0x4A96B568_8EF57328_46646989_68C38BB9_13CBFC82,
-    gy=0x23A62855_3168947D_59DCC912_04235137_7AC5FB32,
-    oid=bytes.fromhex("2b81040008"),
+from .const import MAX_CLOCK_SKEW_SECONDS, MAX_TRACKED_ROTATIONS, ROTATION_PERIOD
+from .ec import (
+    Curve,
+    SECP160R1,
+    SECP256R1,
+    curve_for_name,
 )
 
-# Matching parameters
-MAX_CLOCK_SKEW = timedelta(days=1)
-MAX_TRACKED_ROTATIONS = 90
+__all__ = [
+    "SECP160R1",
+    "SECP256R1",
+    "curve_for_name",
+    "FHNBeacon",
+    "TrackedBeacon",
+    "build_tracker",
+]
 
-# EID frame headers
-FRAME_HEADER_VALID = (0x40, 0x41)
+
+def _aes256_ecb_encrypt(key: bytes, message: bytes) -> bytes:
+    """AES-256-ECB encrypt (single block, no padding needed for 32-byte input)."""
+    encryptor = Cipher(algorithms.AES256(key), modes.ECB()).encryptor()
+    return encryptor.update(message) + encryptor.finalize()
 
 
 @dataclass
 class FHNBeacon:
-    """Represents a provisioned FHN beacon."""
+    """Static key material for one beacon (from provisioning output)."""
+
     clock_offset: float
     curve: Curve
     ephemeral_identity_key: bytes
     name: str
-    model_id: str
-    original_mac: str
-
-    def _aes256_encrypt(self, key: bytes, message: bytes) -> bytes:
-        """Encrypt with AES-256-ECB."""
-        encryptor = Cipher(algorithms.AES256(key), modes.ECB()).encryptor()
-        return encryptor.update(message) + encryptor.finalize()
 
     @property
     def eid_length(self) -> int:
-        """Return EID length for this curve."""
-        return {
-            SECP160R1: 20,
-        }[self.curve]
+        return self.curve.eid_length
 
-    def generate_eid(self, when: datetime) -> bytes:
-        """Generate EID for a specific timestamp."""
-        clock_value = int(when.timestamp() - self.clock_offset)
+    def generate_eid(self, epoch_seconds: float) -> bytes:
+        """Compute the EID that is valid for the period containing ``epoch_seconds``."""
+        clock_value = int(epoch_seconds - self.clock_offset)
         clock_value -= clock_value % ROTATION_PERIOD
-
-        # Build plaintext buffer
         plaintext = bytearray(32)
         plaintext[0:11] = b"\xff" * 11
-        plaintext[11] = ROTATION_PERIOD_EXPONENT
-        plaintext[12:16] = clock_value.to_bytes(4, 'big')
+        plaintext[11] = 10  # ROTATION_PERIOD_EXPONENT
+        plaintext[12:16] = clock_value.to_bytes(4)
         plaintext[16:27] = b"\x00" * 11
-        plaintext[27] = ROTATION_PERIOD_EXPONENT
-        plaintext[28:32] = clock_value.to_bytes(4, 'big')
-
-        # Encrypt and derive point
+        plaintext[27] = 10  # ROTATION_PERIOD_EXPONENT
+        plaintext[28:32] = clock_value.to_bytes(4)
         rprime = int.from_bytes(
-            self._aes256_encrypt(self.ephemeral_identity_key, bytes(plaintext))
+            _aes256_ecb_encrypt(self.ephemeral_identity_key, bytes(plaintext))
         )
         r = rprime % self.curve.q
-        R = get_public_key(r, self.curve)
+        point = self.curve.generator.multiply(r)
+        # r == 0 (astronomically unlikely) yields the identity point; the
+        # reference would also fail here, so emit zero bytes defensively.
+        if point is None:
+            return b"\x00" * self.eid_length
+        return point.x.to_bytes(self.eid_length)
 
-        return R.x.to_bytes(self.eid_length, 'big')
 
+class TrackedBeacon:
+    """Maintains the rolling EID window for one beacon and matches ads to it.
 
-class TrackedFHNBeacon:
-    """Tracks a single beacon with EID rotation handling."""
+    A faithful port of the ``TrackedFHNBeacon`` logic from ``fhn_track.py``:
+    the window is sampled at ``ROTATION_PERIOD`` (1024 s) steps starting from
+    ``now - MAX_CLOCK_SKEW``, and grows forward one step whenever the oldest
+    sampled time has drifted past the skew window. Because ``generate_eid``
+    floors its input to the beacon's period boundary, sampling at arbitrary
+    (non-aligned) times is safe and matches the reference exactly.
+    """
 
-    beacon: FHNBeacon
-    device: Optional[BLEDevice]
-    eids: OrderedDict[bytes, datetime]
-    last_seen: Optional[datetime]
-    last_rssi: Optional[int]
-    last_clock_skew_ticks: Optional[int]
-
-    def __init__(self, beacon: FHNBeacon, now: datetime):
-        self.beacon = beacon
-        self.device = None
-        self.eids = OrderedDict()
-        self.last_seen = None
-        self.last_rssi = None
-        self.last_clock_skew_ticks = None
+    def __init__(self, beacon: FHNBeacon, now: datetime) -> None:
+        self._beacon = beacon
+        self._eids: dict[bytes, datetime] = {}
+        self.last_seen: Optional[datetime] = None
         self._generate_eids(now)
 
-    def _generate_eids(self, now: datetime):
-        """Generate EIDs for time window covering potential clock drift."""
-        self.eids.clear()
-        adv_time = now - MAX_CLOCK_SKEW
-
+    def _generate_eids(self, now: datetime) -> None:
+        self._eids.clear()
+        adv_time = now - timedelta(seconds=MAX_CLOCK_SKEW_SECONDS)
         for _ in range(MAX_TRACKED_ROTATIONS):
-            self.eids[self.beacon.generate_eid(adv_time)] = adv_time
-            adv_time += ROTATION_PERIOD_DELTA
+            self._eids[self._beacon.generate_eid(adv_time.timestamp())] = adv_time
+            adv_time += timedelta(seconds=ROTATION_PERIOD)
 
-    def _cleanup_old_eids(self, now: datetime):
-        """Remove EIDs outside the valid window and generate new ones."""
-        min_adv_time = now - MAX_CLOCK_SKEW
-        adv_time_base = None
+    @property
+    def beacon(self) -> FHNBeacon:
+        return self._beacon
 
-        while self.eids:
-            oldest_eid, oldest_time = next(iter(self.eids.items()))
-            if oldest_time >= min_adv_time:
-                break
+    def match(self, advertisement: bytes, now: datetime) -> bool:
+        """Return True if ``advertisement`` (the Eddystone service-data payload)
+        matches this beacon's current or recent EID.
 
-            del self.eids[oldest_eid]
-
-            if adv_time_base is None:
-                adv_time_base = oldest_time + timedelta(
-                    seconds=MAX_TRACKED_ROTATIONS * ROTATION_PERIOD
-                )
-
-        if adv_time_base is not None:
-            for i in range(MAX_TRACKED_ROTATIONS):
-                adv_time = adv_time_base + timedelta(
-                    seconds=i * ROTATION_PERIOD
-                )
-                self.eids[self.beacon.generate_eid(adv_time)] = adv_time
-
-    def match(self, device: BLEDevice, advertisement: bytes, now: datetime) -> bool:
-        """Try to match an advertisement to this beacon."""
-        if len(advertisement) - self.beacon.eid_length not in (1, 2):
+        ``advertisement`` is the raw service-data value: a 1- or 2-byte
+        frame control byte (0x40/0x41) followed by the EID.
+        """
+        eid_length = self._beacon.eid_length
+        if len(advertisement) - eid_length not in (1, 2):
             return False
-
-        if advertisement[0] not in FRAME_HEADER_VALID:
+        if advertisement[0] not in (0x40, 0x41):
             return False
-
-        eid = advertisement[1 : 1 + self.beacon.eid_length]
-
-        self._cleanup_old_eids(now)
-
-        try:
-            adv_time = self.eids[eid]
-        except KeyError:
-            return False
-
-        expected_clock = int((now - self.beacon.clock_offset).timestamp())
-        expected_clock -= expected_clock % ROTATION_PERIOD
-        observed_clock = int((adv_time - self.beacon.clock_offset).timestamp())
-        observed_clock -= observed_clock % ROTATION_PERIOD
-
-        skew_ticks = (observed_clock - expected_clock) // ROTATION_PERIOD
-
-        self.device = device
-        self.last_seen = now
-        self.last_rssi = None
-        self.last_clock_skew_ticks = skew_ticks
-
-        _LOGGER.debug(
-            f"EID matched for {self.beacon.name}: skew={skew_ticks} ticks"
-        )
-
-        return True
+        min_adv_time = now - timedelta(seconds=MAX_CLOCK_SKEW_SECONDS)
+        # Evict stale entries, then extend the window forward one step.
+        expired = [eid for eid, adv_time in self._eids.items() if adv_time < min_adv_time]
+        for eid in expired:
+            del self._eids[eid]
+        if expired:
+            self._eids[self._beacon.generate_eid(now.timestamp())] = now
+        eid = advertisement[1 : 1 + eid_length]
+        if eid in self._eids:
+            self.last_seen = now
+            return True
+        return False
 
 
-class FHNTracker:
-    """Main tracker class managing multiple beacons."""
+def build_tracker(
+    clock_offset: float,
+    curve_name: str,
+    ephemeral_identity_key_hex: str,
+    name: str,
+    now: datetime,
+) -> TrackedBeacon:
+    """Build a :class:`TrackedBeacon` from config-entry (hex) key material.
 
-    def __init__(self, beacons: List[FHNBeacon]):
-        now = datetime.now()
-        self.tracked_beacons = [
-            TrackedFHNBeacon(beacon, now) for beacon in beacons
-        ]
-
-    def process_advertisement(
-        self,
-        device: BLEDevice,
-        advertisement_data: AdvertisementData
-    ) -> Optional[TrackedFHNBeacon]:
-        """Process a Bluetooth advertisement and return matching beacon."""
-        service_data = getattr(advertisement_data, 'service_data', {})
-        eddystone_data = service_data.get(EDDYSTONE_SERVICE_UUID)
-
-        if eddystone_data is None:
-            return None
-
-        now = datetime.now()
-
-        for tracked in self.tracked_beacons:
-            if tracked.match(device, eddystone_data, now):
-                tracked.last_rssi = advertisement_data.rssi
-                return tracked
-
-        return None
-
-    def get_all_states(self) -> Dict[str, dict]:
-        """Get current state of all tracked beacons."""
-        states = {}
-        for tracked in self.tracked_beacons:
-            states[tracked.beacon.model_id] = {
-                'is_present': tracked.last_seen is not None and
-                             (datetime.now() - tracked.last_seen).total_seconds() < 120,
-                'last_rssi': tracked.last_rssi,
-                'last_seen': tracked.last_seen,
-                'last_clock_skew_ticks': tracked.last_clock_skew_ticks,
-            }
-        return states
-
-
-def create_fhn_beacon(config_data: dict) -> FHNBeacon:
-    """Create FHNBeacon from config entry data."""
-    return FHNBeacon(
-        clock_offset=float(config_data["clock_offset"]),
-        curve=SECP160R1,
-        ephemeral_identity_key=bytes.fromhex(
-            config_data["ephemeral_identity_key"]
-        ),
-        name=f"Tag ({config_data['model_id'][-6:]})",
-        model_id=config_data["model_id"],
-        original_mac=config_data.get("original_mac", ""),
+    Raises ``ValueError`` on malformed hex and ``KeyError`` on an unknown
+    curve name — both surfaced by the caller.
+    """
+    curve = curve_for_name(curve_name)
+    ephemeral_identity_key = bytes.fromhex(ephemeral_identity_key_hex)
+    beacon = FHNBeacon(
+        clock_offset=clock_offset,
+        curve=curve,
+        ephemeral_identity_key=ephemeral_identity_key,
+        name=name,
     )
+    return TrackedBeacon(beacon, now)

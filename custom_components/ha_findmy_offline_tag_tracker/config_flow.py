@@ -1,93 +1,131 @@
-"""Config flow for FHN Tracker integration."""
+"""Config flow for the Find My Offline Tag Tracker (Loshall Tag) integration."""
 
-import voluptuous as vol
+from __future__ import annotations
+
 import logging
+import re
 from typing import Any
 
-from homeassistant import config_entries
-from homeassistant.data_entry_flow import FlowResult
-from homeassistant.exceptions import HomeAssistantError
+import voluptuous as vol
 
-from .fhn_codec import FHNBeacon, SECP160R1
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
+
+from .const import DOMAIN
+from .ec import _CURVES
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_SCHEMA = vol.Schema({
-    vol.Required("shared_secret"): str,
-    vol.Required("account_key"): str,
-    vol.Required("ephemeral_identity_key"): str,
-    vol.Required("model_id"): str,
-    vol.Optional("original_mac", default=""): str,
-    vol.Required("clock_offset"): str,
-})
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_KNOWN_CURVES = sorted(_CURVES)
 
 
-def validate_fhn_keys(user_input: dict) -> None:
-    """Validate FHN provisioning keys are properly formatted."""
-    bytes.fromhex(user_input["ephemeral_identity_key"])
-    bytes.fromhex(user_input["account_key"])
-    bytes.fromhex(user_input["shared_secret"])
-    float(user_input["clock_offset"])
-
-    if not user_input["model_id"].startswith("0x"):
-        raise ValueError("Model ID must start with 0x")
-    int(user_input["model_id"], 16)
+def _is_valid_hex(value: str) -> bool:
+    return bool(_HEX_RE.match(value or "")) and len(value) % 2 == 0
 
 
-class FHNTrackerFlowHandler(config_entries.ConfigFlow, domain="fhn_tracker"):
-    """Handle a config flow for FHN Tracker."""
+def _is_valid_eik(value: str) -> bool:
+    if not _is_valid_hex(value):
+        return False
+    length = len(bytes.fromhex(value))
+    return length in (20, 32)  # secp160r1 -> 20 bytes, secp256r1 -> 32 bytes
+
+
+def _validate_clock_offset(value: str) -> bool:
+    try:
+        float(value)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+USER_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): str,
+        vol.Required("clock_offset"): str,
+        vol.Required("curve", default="secp160r1"): vol.In(_KNOWN_CURVES),
+        vol.Required("ephemeral_identity_key"): str,
+    }
+)
+
+
+class ConfigFlowHandler(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for the Loshall Tag integration."""
 
     VERSION = 1
-    MINOR_VERSION = 1
 
-    async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
-        """Handle the initial step."""
-        errors: dict[str, str] = {}
-
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> Any:
         if user_input is not None:
-            try:
-                validate_fhn_keys(user_input)
+            errors: dict[str, str] = {}
 
-                beacon = FHNBeacon(
-                    clock_offset=float(user_input["clock_offset"]),
-                    curve=SECP160R1,
-                    ephemeral_identity_key=bytes.fromhex(
-                        user_input["ephemeral_identity_key"]
-                    ),
-                    name="Test Beacon",
-                    model_id=user_input["model_id"],
-                    original_mac=user_input.get("original_mac", ""),
-                )
+            name = user_input["name"].strip()
+            if not name:
+                errors["name"] = "name_required"
 
-                from datetime import datetime
-                test_eid = beacon.generate_eid(datetime.now())
-                if len(test_eid) != beacon.eid_length:
-                    raise ValueError("EID generation failed")
+            clock_offset = user_input["clock_offset"]
+            if not _validate_clock_offset(clock_offset):
+                errors["clock_offset"] = "invalid_clock_offset"
+
+            curve = user_input["curve"]
+            eik = user_input["ephemeral_identity_key"].strip()
+            if not _is_valid_eik(eik):
+                errors["ephemeral_identity_key"] = "invalid_eik"
+
+            if not errors:
+                # De-duplicate: one entry per ephemeral identity key.
+                existing_eik = eik.lower()
+                for existing in self._async_current_entries():
+                    stored = existing.data.get("ephemeral_identity_key")
+                    if stored is not None and stored.lower() == existing_eik:
+                        raise AbortFlow("already_configured")
 
                 return self.async_create_entry(
-                    title=f"Tag ({user_input['model_id'][-6:]})",
-                    data=user_input,
+                    title=name,
+                    data={
+                        "name": name,
+                        "clock_offset": clock_offset,
+                        "curve": curve,
+                        "ephemeral_identity_key": eik.lower(),
+                    },
                 )
-            except ValueError as err:
-                errors["base"] = str(err)
-            except Exception as err:
-                errors["base"] = "invalid_keys"
-                _LOGGER.exception(f"Unexpected error: {err}")
 
-        return self.async_show_form(
-            step_id="user",
-            data_schema=DATA_SCHEMA,
-            errors=errors,
-            description_placeholders={
-                "instructions": (
-                    "**From fhn_provision.py output:**\n\n"
-                    "- `Shared Secret:` paste value\n"
-                    "- `Account Key:` paste value\n"
-                    "- `Ephemeral Identity Key:` paste value\n"
-                    "- `Model ID:` keep 0x prefix\n"
-                    "- `Original MAC:` optional\n"
-                    "- `Clock Offset:` numeric value\n\n"
-                    "**Note:** Ensure no spaces in key values."
-                ),
-            },
+            return self.async_show_form(
+                step_id="user", data_schema=USER_SCHEMA, errors=errors
+            )
+
+        return self.async_show_form(step_id="user", data_schema=USER_SCHEMA)
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Return the options flow for this config entry."""
+        return OptionsFlowHandler(config_entry)
+
+
+class OptionsFlowHandler(OptionsFlow):
+    """Handle options for the Loshall Tag integration."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        # `OptionsFlow.config_entry` is a read-only property; store a copy.
+        self._entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> Any:
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    "presence_timeout",
+                    default=self._entry.options.get(
+                        "presence_timeout", 300
+                    ),
+                ): vol.Coerce(int),
+            }
         )
+        return self.async_show_form(step_id="init", data_schema=schema)

@@ -1,16 +1,18 @@
 {
   "domain": "ha_findmy_offline_tag_tracker",
-  "name": "FindMy Offline Tag Tracker",
+  "name": "Find My Offline Tag Tracker (Loshall Tag)",
   "version": "1.0.0",
-  "documentation": "https://github.com/smaeul/fhn-beacon-tools",
-  "issue_tracker": "https://github.com/smaeul/fhn-beacon-tools/issues",
-  "requirements": [
-    "fastecdsa>=2.3.0",
-    "cryptography>=41.0.0",
-    "bleak>=0.20.0"
-  ],
-  "codeowners": [],
+  "codeowners": ["@Denkisen"],
+  "config_flow": true,
   "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/Denkisen/ha_findmy_offline_tag_tracker",
+  "integration_type": "device",
   "iot_class": "local_push",
-  "loggers": ["ha_findmy_offline_tag_tracker"]
+  "loggers": ["habluetooth", "bleak"],
+  "bluetooth": [
+    {
+      "connectable": false,
+      "service_data_uuid": "0000feaa-0000-1000-8000-00805f9b34fb"
+    }
+  ]
 }
