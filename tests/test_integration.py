@@ -55,8 +55,8 @@ def ble_register_stub():
     """Stub out the real BLE callback registration (no BlueZ in tests).
 
     HA imports the coordinator as ``custom_components.ha_findmy_offline_tag_tracker.coordinator``,
-    so we must patch the attribute on *that* module object (not a separately
-    imported copy) for the running coordinator to see the stub.
+    so we must patch the attributes on *that* module object (not a separately
+    imported copy) for the running coordinator to see the stubs.
     """
     calls = []
 
@@ -68,9 +68,23 @@ def ble_register_stub():
 
         return _unsub
 
-    with patch(
-        "custom_components.ha_findmy_offline_tag_tracker.coordinator.async_register_callback",
-        _fake_register,
+    def _fake_track_unavailable(hass, callback, address, connectable=True, *a, **k):
+        calls.append({"unavailable": address, "callback": callback})
+
+        def _unsub():
+            calls[-1]["unsubscribed"] = True
+
+        return _unsub
+
+    with (
+        patch(
+            "custom_components.ha_findmy_offline_tag_tracker.coordinator.async_register_callback",
+            _fake_register,
+        ),
+        patch(
+            "custom_components.ha_findmy_offline_tag_tracker.coordinator.async_track_unavailable",
+            _fake_track_unavailable,
+        ),
     ):
         yield calls
 
@@ -129,6 +143,12 @@ async def test_full_setup_and_advertisement(
     assert hass.states.get(presence_id).state == "on"
     assert hass.states.get(rssi_id).state == "-63"
     assert hass.states.get(last_seen_id).state is not None
+
+    # Once the tag's address is known, an unavailable tracker is registered
+    # for it (this is the fast 'tag left' path for the door use case).
+    assert any(
+        c.get("unavailable") == "AA:BB:CC:00:00:01" for c in ble_register_stub
+    )
 
     # Presence timeout flips the tag back out of range. Drive the check
     # directly: set last_seen beyond the timeout, then invoke the presence
@@ -205,3 +225,61 @@ async def test_restored_in_range_can_time_out(
     await hass.async_block_till_done()
 
     assert coordinator.is_home is False
+
+
+async def test_unavailable_signal_flips_presence_off(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """HA's per-address 'unavailable' signal must flip the tag out of range.
+
+    This is the snappy 'tag left' path: when the tag's address stops
+    advertising, HA fires the unavailable callback and we go OFF without
+    waiting for the (long) presence timeout.
+    """
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Loshall Tag 1",
+        data=_entry_data(),
+        unique_id=None,
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = entry.runtime_data
+    callback = ble_register_stub[0]["callback"]
+
+    # Bring the tag in range.
+    eik = bytes.fromhex(EIK_HEX)
+    ad = _current_advertisement(eik)
+    service_info = SimpleNamespace(
+        service_data={EDDYSTONE_SERVICE_UUID: ad},
+        rssi=-55,
+        address="AA:BB:CC:00:00:01",
+    )
+    callback(service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
+    await hass.async_block_till_done()
+    assert coordinator.is_home is True
+
+    # The unavailable tracker for the address was registered on first sight.
+    unavailable_cb = next(
+        c["callback"]
+        for c in ble_register_stub
+        if c.get("unavailable") == "AA:BB:CC:00:00:01"
+    )
+
+    # The tag's address stops advertising -> HA fires unavailable.
+    unavailable_cb(SimpleNamespace(address="AA:BB:CC:00:00:01"))
+    await hass.async_block_till_done()
+    assert coordinator.is_home is False
+
+    # A stale unavailable for an old address must be ignored.
+    callback(service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
+    await hass.async_block_till_done()
+    assert coordinator.is_home is True
+    unavailable_cb(SimpleNamespace(address="OLD:ADDRESS:00:00:00"))
+    await hass.async_block_till_done()
+    assert coordinator.is_home is True

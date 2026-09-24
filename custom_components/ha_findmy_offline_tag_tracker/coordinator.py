@@ -9,6 +9,11 @@ This mirrors the pattern used by built-in passive-BLE integrations such as
 ``bthome`` (see ``homeassistant.components.bluetooth.update_coordinator``):
 a plain object that calls the synchronous ``async_register_callback`` and
 tracks its unsubs in ``_on_stop``.
+
+In addition to matching advertisements, the coordinator follows HA's
+per-address *unavailable* signal for the tag's current MAC (re-pointing it on
+every MAC change) so a real departure flips presence OFF in ~5 min instead of
+waiting for the long presence-timeout backstop — see AGENTS.md for the why.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from homeassistant.components.bluetooth import (
     BluetoothScanningMode,
     BluetoothServiceInfoBleak,
     async_register_callback,
+    async_track_unavailable,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
@@ -62,6 +68,7 @@ class TagCoordinator:
         self._rssi: Optional[int] = None
         self._address: Optional[str] = None
         self._is_home = False
+        self._unsub_unavailable: Optional[Callable[[], None]] = None
 
     # ------------------------------------------------------------------ #
     # Listener management
@@ -94,10 +101,36 @@ class TagCoordinator:
         if self.tracker.match(advertisement, now):
             self._last_seen = now
             self._rssi = service_info.rssi
-            self._address = service_info.address
+            address = service_info.address
+            if address != self._address:
+                self._address = address
+                self._async_track_address_unavailable(address)
             if not self._is_home:
                 self._is_home = True
             self._notify()
+
+    def _async_track_address_unavailable(self, address: str) -> None:
+        """Follow HA's per-address "device gone" signal for the current tag address.
+
+        The tag's MAC randomises, so whenever we see a *new* address we re-point
+        this tracker. HA fires the callback once the address stops advertising
+        (scanner expiry + its 5-minute sweep), which is a physically meaningful
+        "tag left" signal — far snappier than waiting for the presence timeout.
+        """
+        if self._unsub_unavailable is not None:
+            self._unsub_unavailable()
+
+        @callback
+        def _unavailable(_service_info: BluetoothServiceInfoBleak) -> None:
+            if _service_info.address != self._address:
+                return  # stale: the tag already moved to a newer address
+            self._is_home = False
+            _LOGGER.debug("%s: address %s unavailable, marking out of range", self._name, address)
+            self._notify()
+
+        self._unsub_unavailable = async_track_unavailable(
+            self.hass, _unavailable, address, connectable=False
+        )
 
     @callback
     def async_start(self) -> CALLBACK_TYPE:
@@ -125,6 +158,9 @@ class TagCoordinator:
         for unsub in self._on_stop:
             unsub()
         self._on_stop.clear()
+        if self._unsub_unavailable is not None:
+            self._unsub_unavailable()
+            self._unsub_unavailable = None
         self._listeners.clear()
 
     @callback

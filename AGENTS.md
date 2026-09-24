@@ -29,5 +29,22 @@ Ephemeral Identity (EID) against the user's provisioning key material.
   raw bleak scanner such as `fhn_track.py`, which sees every ad). A timeout
   below 1024 s therefore flips the tag "away" on every rotation even while it
   is in range — the default is `ROTATION_PERIOD * 2`.
+- **Presence OFF ("tag left") is driven by HA's per-address *unavailable*
+  signal, not by the timeout.** The timeout is only a backstop. The coordinator
+  registers `async_track_unavailable(hass, cb, address, connectable=False)` for
+  the tag's *current* MAC and **re-points it whenever it sees a new MAC**
+  (the MAC randomises). When the address stops advertising, habluetooth fires
+  the unavailable callback, so the tag flips "away" in ~5 min (the
+  `UNAVAILABLE_TRACK_SECONDS = 300 s` sweep is the binding gate) instead of
+  ~34 min (the timeout). This is what makes door-correlation usable: a real
+  departure must produce an "away" so the next arrival is a clean ON edge.
+- **The unavailable callback MUST be guarded by the *event's* address, not the
+  closure-captured one** (`if _service_info.address != self._address: return`).
+  A MAC rotation makes the *old* address stop advertising, which fires its
+  stale unavailable event; without the guard (and the guard comparing the event
+  address to the *current* address) a stale event would wrongly flip the tag
+  "away" mid-rotation. Safe because the 1024 s rotation gap cannot host a
+  300 s sweep landing, and even at worst the tag re-advertises within ~1 s of
+  the gap.
 - All datetimes are **timezone-aware UTC** (required by the TIMESTAMP sensor
   and for correct EID epoch computation). Do not introduce naive `datetime.now()`.
