@@ -1,0 +1,3 @@
+bleak>=0.22
+cryptography
+paho-mqtt>=2.0

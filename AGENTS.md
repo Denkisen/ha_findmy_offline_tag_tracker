@@ -46,5 +46,25 @@ Ephemeral Identity (EID) against the user's provisioning key material.
   "away" mid-rotation. Safe because the 1024 s rotation gap cannot host a
   300 s sweep landing, and even at worst the tag re-advertises within ~1 s of
   the gap.
+- **The beacon's stored `clock_offset` drifts — do NOT predict rotation
+  timing from it.** A real capture showed the schedule-computed rotation
+  boundary ~506 s away from the observed MAC change. The only reliable
+  rotation signal is the **MAC change itself** (the tag changes MAC exactly
+  when the EID rotates). `scanner/presence_engine.py` is therefore
+  MAC-change-driven, not schedule-driven.
+- **Fast departure detection lives in `scanner/` (raw-bleak sidecar), not in
+  the HA integration.** HA's habluetooth hard-codes a 300 s unavailable sweep
+  (unconfigurable) and its service_data dedup drops unchanged ads, so the
+  in-HA integration can only flip "away" in ~5 min. The sidecar runs on the
+  HA host (`/opt/fhn_presence`, systemd), sees every ad, and flips "away" in
+  ~200 s (normal) / ~400 s (right after a rotation) — the floor is the
+  beacon's own ~148 s rotation silence (it stops advertising while
+  re-keying). Pushes state to HA via MQTT (HA auto-discovery binary sensor).
+  The in-HA integration stays as the fallback/backstop.
+- **Scanner thresholds:** `FHN_NORMAL_THRESHOLD` (200 s) must exceed the
+  beacon's worst-case rotation silence (observed 148 s, slowly growing with
+  its clock drift); `FHN_ROTATION_THRESHOLD` (400 s) covers the same plus
+  drift growth over the window. Rotation-silence gaps are logged
+  ("EID rotation, silence Ns") — tune from the logs.
 - All datetimes are **timezone-aware UTC** (required by the TIMESTAMP sensor
   and for correct EID epoch computation). Do not introduce naive `datetime.now()`.
