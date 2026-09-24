@@ -20,6 +20,12 @@ MAX_TRACKED_ROTATIONS = 90
 
 # After this many seconds without a matching advertisement, the tag is
 # considered no longer in range.
-DEFAULT_PRESENCE_TIMEOUT = 300
+#
+# This MUST be larger than ROTATION_PERIOD: Home Assistant's bluetooth manager
+# (habluetooth) suppresses advertisements whose service_data is unchanged, and
+# the tag's Eddystone payload only changes when the EID rotates. So the
+# callback fires at most once every ROTATION_PERIOD seconds, and any timeout
+# below that would flip the tag "away" on every rotation even while in range.
+DEFAULT_PRESENCE_TIMEOUT = ROTATION_PERIOD * 2  # 2048 s
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]

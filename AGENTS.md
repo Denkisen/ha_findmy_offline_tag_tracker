@@ -16,8 +16,18 @@ Ephemeral Identity (EID) against the user's provisioning key material.
 - **Never** pin `cryptography` (or any package HA Core already ships) in
   `manifest.json` `requirements` — HAOS can't override its constrained version
   and setup will fail with "Requirements ... not found".
-- The beacon's **MAC address randomises** and its EID rotates every 1024 s, so
-  the stable identity for `device_info`/`unique_id` is the ephemeral identity
-  key (EID), not the MAC. MAC is exposed only as an attribute.
+- The beacon's **MAC address randomises** and its EID rotates every 1024 s
+  (`ROTATION_PERIOD`), so the stable identity for `device_info`/`unique_id` is
+  the ephemeral identity key (EID), not the MAC. MAC is exposed only as an
+  attribute.
+- **`DEFAULT_PRESENCE_TIMEOUT` must stay > `ROTATION_PERIOD` (1024 s).** HA's
+  bluetooth manager (habluetooth) *suppresses advertisements whose
+  `service_data` is unchanged* (see `habluetooth/manager.py`, the
+  identical-`service_data` short-circuit before `_subclass_discover_info`), and
+  the tag's Eddystone payload only changes when the EID rotates. So our BLE
+  callback fires **at most once per 1024 s**, not per advertisement (unlike a
+  raw bleak scanner such as `fhn_track.py`, which sees every ad). A timeout
+  below 1024 s therefore flips the tag "away" on every rotation even while it
+  is in range — the default is `ROTATION_PERIOD * 2`.
 - All datetimes are **timezone-aware UTC** (required by the TIMESTAMP sensor
   and for correct EID epoch computation). Do not introduce naive `datetime.now()`.

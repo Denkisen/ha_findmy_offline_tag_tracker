@@ -164,3 +164,44 @@ async def test_setup_with_invalid_key_fails(hass: HomeAssistant, enable_custom_i
     await hass.async_block_till_done()
 
     assert entry.state.value == "setup_error"
+
+
+async def test_restored_in_range_can_time_out(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """A restored "in range" state must still be re-evaluated by the timeout.
+
+    Regression: restoring ``is_home=True`` with ``last_seen=None`` used to make
+    the tag stay "on" forever (the presence check returned early when
+    last_seen was None).
+    """
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Loshall Tag 1",
+        data=_entry_data(),
+        unique_id=None,
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = entry.runtime_data
+
+    # Simulate a restored "on" state from a previous session.
+    coordinator.restore_is_home(True)
+    assert coordinator.is_home is True
+    # restore_is_home() stamps last_seen so the timeout can re-evaluate.
+    assert coordinator.last_seen is not None
+
+    # Let the timeout elapse with no advertisements.
+    timeout = entry.options.get("presence_timeout", DEFAULT_PRESENCE_TIMEOUT)
+    coordinator._last_seen = datetime.now(timezone.utc) - timedelta(
+        seconds=timeout + 1
+    )
+    coordinator._async_check_presence(datetime.now(timezone.utc))
+    await hass.async_block_till_done()
+
+    assert coordinator.is_home is False

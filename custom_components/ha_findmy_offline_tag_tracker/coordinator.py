@@ -174,8 +174,16 @@ class TagCoordinator:
         return self._is_home
 
     def restore_is_home(self, value: bool) -> None:
-        """Restore the in-range flag from the entity's last known state."""
+        """Restore the in-range flag from the entity's last known state.
+
+        A restored "in range" state is treated as "seen at restart" so the
+        presence timeout can still re-evaluate it: without this, a restored
+        ``_is_home=True`` with ``_last_seen=None`` would never flip back to
+        out-of-range (the timeout check returns early when last_seen is None).
+        """
         self._is_home = value
+        if value:
+            self._last_seen = datetime.now(timezone.utc)
 
     @property
     def last_seen(self) -> Optional[datetime]:

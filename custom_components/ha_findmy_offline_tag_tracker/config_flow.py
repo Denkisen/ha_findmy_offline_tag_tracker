@@ -12,7 +12,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import AbortFlow
 
-from .const import DOMAIN
+from .const import DEFAULT_PRESENCE_TIMEOUT, DOMAIN
 from .ec import _CURVES
 
 _LOGGER = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ class OptionsFlowHandler(OptionsFlow):
                 vol.Required(
                     "presence_timeout",
                     default=self._entry.options.get(
-                        "presence_timeout", 300
+                        "presence_timeout", DEFAULT_PRESENCE_TIMEOUT
                     ),
                 ): vol.Coerce(int),
             }
