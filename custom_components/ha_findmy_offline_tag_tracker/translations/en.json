@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set Up FindMy Tag",
+        "description": "{instructions}",
+        "data": {
+          "shared_secret": "Shared Secret",
+          "account_key": "Account Key",
+          "ephemeral_identity_key": "Ephemeral Identity Key",
+          "model_id": "Model ID (0x...)",
+          "original_mac": "Original MAC Address",
+          "clock_offset": "Clock Offset (seconds)"
+        }
+      }
+    },
+    "error": {
+      "invalid_keys": "Invalid key format. Check the values carefully.",
+      "unknown_error": "An unexpected error occurred."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "rssi": {
+        "name": "RSSI"
+      },
+      "last_seen": {
+        "name": "Last Seen"
+      },
+      "clock_skew": {
+        "name": "Clock Skew"
+      }
+    },
+    "binary_sensor": {
+      "presence": {
+        "name": "Present"
+      }
+    }
+  }
+}
