@@ -557,3 +557,57 @@ async def test_poll_keeps_presence_fresh_and_relearns_mac(
             await hass.async_block_till_done()
             assert coordinator.is_home is False
             assert coordinator.last_seen is None
+
+
+async def test_device_tracker_entity_reflects_presence(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """The device_tracker platform makes the tag assignable to a person.
+
+    In range maps to the tracker's associated zone (Home by default); out of
+    range maps to not_home. The person component lists entities in the
+    device_tracker domain, so this is what enables "assign the tag to me".
+    """
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Loshall Tag 1",
+        data=_entry_data(),
+        unique_id=None,
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    trackers = [e for e in hass.states.async_entity_ids() if e.startswith("device_tracker.")]
+    assert len(trackers) == 1, list(hass.states.async_entity_ids())
+    tracker_id = trackers[0]
+
+    # Out of range -> not_home, with the BLE source type.
+    state = hass.states.get(tracker_id)
+    assert state.state == "not_home"
+    assert state.attributes["source_type"] == "bluetooth_le"
+
+    # An advertisement flips the tracker to the associated zone (Home).
+    uuid_regs = [c for c in ble_register_stub if "match_dict" in c]
+    eik = bytes.fromhex(EIK_HEX)
+    service_info = SimpleNamespace(
+        service_data={EDDYSTONE_SERVICE_UUID: _current_advertisement(eik)},
+        rssi=-57,
+        address="AA:BB:CC:00:00:01",
+    )
+    uuid_regs[0]["callback"](service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(tracker_id).state == "home"
+
+    # Presence timeout flips it back to not_home.
+    coordinator = entry.runtime_data
+    timeout = entry.options.get("presence_timeout", DEFAULT_PRESENCE_TIMEOUT)
+    coordinator._last_seen = datetime.now(timezone.utc) - timedelta(seconds=timeout + 1)
+    coordinator._async_check_presence(datetime.now(timezone.utc))
+    await hass.async_block_till_done()
+
+    assert hass.states.get(tracker_id).state == "not_home"

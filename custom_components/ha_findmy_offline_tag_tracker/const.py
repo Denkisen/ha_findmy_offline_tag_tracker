@@ -44,4 +44,8 @@ DEFAULT_PRESENCE_TIMEOUT = 600  # s
 # restart (the push callbacks can take up to a full EID rotation).
 PRESENCE_POLL_INTERVAL = timedelta(seconds=30)
 
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.DEVICE_TRACKER,
+    Platform.SENSOR,
+]
