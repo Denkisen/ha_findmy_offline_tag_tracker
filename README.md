@@ -112,13 +112,17 @@ action:
 ```bash
 python3 -m venv venv
 venv/bin/pip install homeassistant==2026.9.3 pytest pytest-homeassistant-custom-component
+# Match the Bluetooth stack the box actually runs (HA 2026.9.3 pins it):
+venv/bin/pip install "habluetooth==6.26.11"
 venv/bin/python -m pytest tests/
 ```
 
-Tested on Python 3.14 with the versions above. Tests use the real Home
-Assistant test harness (no BlueZ required — BLE registration is stubbed).
-The codec is verified byte-identical to the reference `fhn-beacon-tools`
-implementation.
+Tested on Python 3.14 with the versions above. The `habluetooth` pin matters:
+newer releases add APIs (e.g. `async_register_advertisement_callback`) that the
+box's version lacks, so tests must run against the same version to be
+faithful. Tests use the real Home Assistant test harness (no BlueZ required —
+BLE registration is stubbed). The codec is verified byte-identical to the
+reference `fhn-beacon-tools` implementation.
 
 ## Troubleshooting
 

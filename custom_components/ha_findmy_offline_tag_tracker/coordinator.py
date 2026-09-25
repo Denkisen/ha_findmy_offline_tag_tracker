@@ -197,10 +197,26 @@ class TagCoordinator:
         unchanged payloads) — the same cadence a raw ``bleak`` scanner sees —
         keeping ``last_seen``/RSSI fresh while the tag is in range. Re-pointed
         on every MAC change, just like the unavailable tracker.
+
+        ``async_register_advertisement_callback`` only exists on newer
+        habluetooth versions. On an older one we simply skip it: the 30 s
+        discovery poll (see ``_async_poll_discovered``) already keeps the tag
+        in range, so the callback is a fast-path bonus, not a requirement.
+        Guarded so an older habluetooth can't crash the coordinator.
         """
         if self._unsub_advertisement is not None:
             self._unsub_advertisement()
-        self._unsub_advertisement = _get_manager(self.hass).async_register_advertisement_callback(
+            self._unsub_advertisement = None
+        manager = _get_manager(self.hass)
+        register = getattr(manager, "async_register_advertisement_callback", None)
+        if register is None:
+            _LOGGER.debug(
+                "%s: habluetooth lacks async_register_advertisement_callback; "
+                "relying on the discovery poll",
+                self._name,
+            )
+            return
+        self._unsub_advertisement = register(
             self._async_handle_per_address_advertisement, address
         )
 
@@ -290,13 +306,23 @@ class TagCoordinator:
         for scanner in manager.async_current_scanners():
             try:
                 discovered = scanner.discovered_devices_and_advertisement_data
-                timestamps = scanner.discovered_device_timestamps
             except Exception:
                 continue
+            # Per-address monotonic timestamps, when available, let us drop
+            # cached ads that predate the presence timeout (e.g. entries
+            # restored from a previous boot). Older habluetooth may not
+            # expose them — in that case we trust the scanner's own
+            # expiration (entries are removed automatically) and the
+            # presence timeout backstop.
+            try:
+                timestamps = scanner.discovered_device_timestamps
+            except Exception:
+                timestamps = None
             for address, (device, adv) in discovered.items():
-                age = now_mono - timestamps.get(address, now_mono)
-                if age < 0 or age > max_age:
-                    continue
+                if timestamps is not None:
+                    age = now_mono - timestamps.get(address, now_mono)
+                    if age < 0 or age > max_age:
+                        continue
                 payload = adv.service_data.get(EDDYSTONE_SERVICE_UUID)
                 if payload is None:
                     continue

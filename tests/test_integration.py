@@ -559,6 +559,84 @@ async def test_poll_keeps_presence_fresh_and_relearns_mac(
             assert coordinator.last_seen is None
 
 
+async def test_older_habluetooth_without_advertisement_api(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """Older habluetooth (as shipped with the user's HA build) must not crash.
+
+    Regression: the production box's habluetooth lacks
+    ``async_register_advertisement_callback`` (AttributeError in the ad
+    callback) and its scanners lack ``discovered_device_timestamps``. The
+    coordinator must degrade to the discovery poll alone and keep the tag in
+    range.
+    """
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Loshall Tag 1",
+        data=_entry_data(),
+        unique_id=None,
+    )
+    entry.add_to_hass(hass)
+
+    discovered: dict[str, tuple[object, object]] = {}
+
+    class _OldScanner:
+        # Only the API the older habluetooth exposes: no timestamps property.
+        @property
+        def discovered_devices_and_advertisement_data(self):
+            return discovered
+
+    class _OldManager:
+        # async_register_advertisement_callback intentionally ABSENT.
+        def async_current_scanners(self):
+            return [_OldScanner()]
+
+    with patch(
+        "custom_components.ha_findmy_offline_tag_tracker.coordinator._get_manager",
+        lambda hass: _OldManager(),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        coordinator = entry.runtime_data
+        assert coordinator.is_home is False
+
+        # Drive the Eddystone service-UUID callback (as HA replays/delivers
+        # ads). This is the exact path that crashed in production:
+        # _async_mark_seen -> _async_track_address_advertisements ->
+        # manager.async_register_advertisement_callback (absent on older
+        # habluetooth). It must now degrade to the poll instead of raising.
+        address = "77:88:99:AA:BB:CC"
+        ad = _current_advertisement(bytes.fromhex(EIK_HEX))
+        uuid_regs = [c for c in ble_register_stub if "match_dict" in c]
+        uuid_regs[0]["callback"](
+            SimpleNamespace(
+                service_data={EDDYSTONE_SERVICE_UUID: ad},
+                rssi=-54,
+                address=address,
+            ),
+            bluetooth.BluetoothChange.ADVERTISEMENT,
+        )
+        await hass.async_block_till_done()
+        # No AttributeError; presence flipped on.
+        assert coordinator.is_home is True
+        assert coordinator.address == address
+        assert coordinator.rssi == -54
+
+        # The poll (without discovered_device_timestamps) keeps it alive.
+        discovered[address] = (
+            SimpleNamespace(address=address, name=None),
+            SimpleNamespace(service_data={EDDYSTONE_SERVICE_UUID: ad}, rssi=-54),
+        )
+        coordinator._last_seen = datetime.now(timezone.utc) - timedelta(seconds=300)
+        coordinator._async_poll_discovered(datetime.now(timezone.utc))
+        await hass.async_block_till_done()
+        assert coordinator.is_home is True
+        assert coordinator.last_seen is not None
+
+
 async def test_two_tags_are_tracked_independently(
     hass: HomeAssistant, enable_custom_integrations, ble_register_stub
 ) -> None:

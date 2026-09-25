@@ -43,12 +43,24 @@ provisioning key material.
   rotations the push callbacks swallowed. Cache entries are freshness-filtered
   against `discovered_device_timestamps` (monotonic; negative age = restored
   from a previous boot) and capped at the presence timeout.
-- **The per-address advertisement callback and the Eddystone service-UUID
-  callback are kept as fast-path secondary signals** (instant arrival /
-  MAC-change detection between polls). They are registered through the
-  bluetooth manager: `_get_manager(hass).async_register_advertisement_callback(
-  cb, address)` (manager method, *not* in `bluetooth.__all__`), re-pointed on
-  every MAC change exactly like the unavailable tracker.
+- **The per-address advertisement callback is a *fast-path bonus that only
+  exists on newer habluetooth* (≥ 7.x); HA 2026.9.3 ships
+  `habluetooth==6.26.11` which does NOT have
+  `async_register_advertisement_callback`.** Registration must be guarded
+  with `getattr(manager, "async_register_advertisement_callback", None)` —
+  an unguarded call crashed the coordinator on the user's box during history
+  replay (`AttributeError`, fuzzy-suggested `async_register_allocation_callback`).
+  On 6.x the poll below is the *only* liveness signal, so it must work on its
+  own; likewise `scanner.discovered_device_timestamps` access is guarded
+  (falls back to trusting the scanner's own entry expiration).
+  **Never develop/test against a newer habluetooth than the box** — the venv
+  must pin `habluetooth==6.26.11` (see README), otherwise tests pass on APIs
+  that don't exist in production.
+- **The Eddystone service-UUID callback and the 30 s poll are the guaranteed
+  signals on every supported habluetooth.** The per-address advertisement
+  callback (manager method, *not* in `bluetooth.__all__`, re-pointed on every
+  MAC change exactly like the unavailable tracker) additionally keeps
+  `last_seen` fresh at the tag's real ad cadence when it is available.
 - **`DEFAULT_PRESENCE_TIMEOUT` (600 s) is a *backstop* only.** Because the
   per-address ad callback above keeps `last_seen` fresh every ad, the timeout
   only catches the edge where neither the per-address signal nor the
