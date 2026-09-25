@@ -23,6 +23,15 @@ signals for the tag's current MAC, re-pointing both whenever the MAC changes:
   fires when the address stops advertising — a real "tag left" edge that
   flips presence OFF in ~5 min instead of waiting for the presence-timeout
   backstop. See AGENTS.md for the why.
+
+As a **pull-based liveness backbone** (the pattern Bermuda uses), the
+coordinator also re-scans the bluetooth manager's discovered-devices cache
+every ``PRESENCE_POLL_INTERVAL`` (30 s), EID-matching each cached
+advertisement. On this deployment the per-address push callback proved
+unreliable (ads were observed reaching the coordinator only every
+8-30 min), so the poll is what actually keeps ``last_seen`` fresh and
+re-learns the tag's MAC after a restart without waiting for the next EID
+rotation.
 """
 
 from __future__ import annotations
@@ -45,7 +54,14 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import DEFAULT_PRESENCE_TIMEOUT, DOMAIN, EDDYSTONE_SERVICE_UUID
+from bluetooth_data_tools import monotonic_time_coarse
+
+from .const import (
+    DEFAULT_PRESENCE_TIMEOUT,
+    DOMAIN,
+    EDDYSTONE_SERVICE_UUID,
+    PRESENCE_POLL_INTERVAL,
+)
 from .fhn_codec import TrackedBeacon
 
 _LOGGER = logging.getLogger(__name__)
@@ -190,7 +206,7 @@ class TagCoordinator:
 
     @callback
     def async_start(self) -> CALLBACK_TYPE:
-        """Register the Bluetooth callback and presence timer."""
+        """Register the Bluetooth callback, presence timer and discovery poll."""
         self._on_stop.append(
             async_register_callback(
                 self.hass,
@@ -204,6 +220,15 @@ class TagCoordinator:
                 self.hass,
                 self._async_check_presence,
                 PRESENCE_CHECK_INTERVAL,
+            )
+        )
+        # Pull-based liveness: re-scan the manager's discovered-devices cache
+        # for the tag's EID, even when no push callback was delivered.
+        self._on_stop.append(
+            async_track_time_interval(
+                self.hass,
+                self._async_poll_discovered,
+                PRESENCE_POLL_INTERVAL,
             )
         )
         return self.async_stop
@@ -238,7 +263,67 @@ class TagCoordinator:
                 int(elapsed),
             )
             self._is_home = False
+            self._rssi = None  # RSSI is a property of a fresh ad; stale value is misleading
             self._notify()
+
+    @callback
+    def _async_poll_discovered(self, _now: datetime) -> None:
+        """Pull the scanner's discovered-devices cache and EID-match the tag.
+
+        Liveness backbone (the pattern Bermuda uses successfully): regardless
+        of whether any push callback was delivered, every poll looks at the
+        latest advertisement cached for each known address. If the tag's
+        Eddystone payload EID-matches, the tag is present — refresh presence.
+        This also catches MAC rotations the service-UUID callback dedup
+        swallowed (a new address with a matching EID), re-pointing the
+        per-address trackers on the way.
+        """
+        manager = _get_manager(self.hass)
+        now = datetime.now(timezone.utc)
+        # A cached ad older than the presence timeout can never legitimately
+        # keep presence alive; negative age means a timestamp restored from a
+        # previous boot (monotonic clock reset) — treat both as stale.
+        max_age = self.entry.options.get(
+            "presence_timeout", DEFAULT_PRESENCE_TIMEOUT
+        )
+        now_mono = monotonic_time_coarse()
+        for scanner in manager.async_current_scanners():
+            try:
+                discovered = scanner.discovered_devices_and_advertisement_data
+                timestamps = scanner.discovered_device_timestamps
+            except Exception:
+                continue
+            for address, (device, adv) in discovered.items():
+                age = now_mono - timestamps.get(address, now_mono)
+                if age < 0 or age > max_age:
+                    continue
+                payload = adv.service_data.get(EDDYSTONE_SERVICE_UUID)
+                if payload is None:
+                    continue
+                if adv.rssi is not None and adv.rssi == -127:
+                    continue  # BlueZ placeholder for a paired-but-absent device
+                if not self.tracker.match(payload, now):
+                    continue
+                _LOGGER.debug(
+                    "%s: poll matched tag at %s (RSSI %s)",
+                    self._name,
+                    address,
+                    adv.rssi,
+                )
+                self._async_mark_seen_from_poll(address, adv.rssi)
+
+    def _async_mark_seen_from_poll(self, address: str, rssi: int | None) -> None:
+        """Refresh presence from a poll hit (no BluetoothServiceInfoBleak)."""
+        now = datetime.now(timezone.utc)
+        self._last_seen = now
+        if rssi is not None:
+            self._rssi = rssi
+        if address != self._address:
+            self._address = address
+            self._async_track_address_unavailable(address)
+            self._async_track_address_advertisements(address)
+        self._is_home = True
+        self._notify()
 
     # ------------------------------------------------------------------ #
     # State accessors

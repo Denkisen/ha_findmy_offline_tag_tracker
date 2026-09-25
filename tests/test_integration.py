@@ -88,6 +88,9 @@ def ble_register_stub():
 
             return _unsub
 
+        def async_current_scanners(self):
+            return []
+
     def _fake_get_manager(hass):
         return _FakeManager()
 
@@ -411,3 +414,146 @@ async def test_mac_rotation_repoints_advertisement_tracker(
     ad_regs = [c for c in ble_register_stub if "advertisement" in c]
     assert any(c["advertisement"] == mac2 for c in ad_regs), ad_regs
     assert coordinator.is_home is True
+
+
+async def test_poll_keeps_presence_fresh_and_relearns_mac(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """The 30 s discovery poll keeps the tag in range even without callbacks.
+
+    Regression for the production bug: the per-address push callback was not
+    delivered for 10+ minutes while the tag advertised, so the 600 s backstop
+    flipped the tag "Away". The poll re-scans the manager's discovered-devices
+    cache, EID-matches the cached Eddystone payload, and refreshes presence —
+    and also re-learns a rotated MAC that no callback reported.
+    """
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Loshall Tag 1",
+        data=_entry_data(),
+        unique_id=None,
+    )
+    entry.add_to_hass(hass)
+
+    # Replace the manager stub with one exposing a scanner whose discovered
+    # cache holds a fresh Eddystone advertisement for a (new) MAC.
+    discovered: dict[str, tuple[object, object]] = {}
+
+    class _PollingScanner:
+        @property
+        def discovered_devices_and_advertisement_data(self):
+            return discovered
+
+        @property
+        def discovered_device_timestamps(self):
+            # Fresh stamps by default; tests override per-address as needed.
+            from bluetooth_data_tools import monotonic_time_coarse
+
+            now = monotonic_time_coarse()
+            return {addr: now for addr in discovered}
+
+    class _PollingManager:
+        def async_register_advertisement_callback(self, callback, address, *a, **k):
+            ble_register_stub.append({"advertisement": address, "callback": callback})
+
+            def _unsub():
+                pass
+
+            return _unsub
+
+        def async_current_scanners(self):
+            return [_PollingScanner()]
+
+    with patch(
+        "custom_components.ha_findmy_offline_tag_tracker.coordinator._get_manager",
+        lambda hass: _PollingManager(),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        coordinator = entry.runtime_data
+        assert coordinator.is_home is False  # nothing seen yet
+
+        # No callbacks fired at all — only the poll sees the tag.
+        address = "77:88:99:AA:BB:CC"
+        eik = bytes.fromhex(EIK_HEX)
+        ad = _current_advertisement(eik)
+        discovered[address] = (
+            SimpleNamespace(address=address, name=None),
+            SimpleNamespace(
+                service_data={EDDYSTONE_SERVICE_UUID: ad},
+                rssi=-54,
+            ),
+        )
+
+        coordinator._async_poll_discovered(datetime.now(timezone.utc))
+        await hass.async_block_till_done()
+
+        assert coordinator.is_home is True
+        assert coordinator.address == address
+        assert coordinator.rssi == -54
+        assert coordinator.last_seen is not None
+        # Per-address trackers re-pointed at the polled address.
+        ad_regs = [c for c in ble_register_stub if "advertisement" in c]
+        assert any(c["advertisement"] == address for c in ad_regs), ad_regs
+
+        # A second poll with the same cached payload keeps presence fresh
+        # (last_seen advances; no false "away").
+        before = coordinator.last_seen
+        coordinator._last_seen = datetime.now(timezone.utc) - timedelta(seconds=300)
+        coordinator._async_poll_discovered(datetime.now(timezone.utc))
+        await hass.async_block_till_done()
+        assert coordinator.is_home is True
+        assert coordinator.last_seen > before
+
+        # A non-matching Eddystone payload from another device is ignored.
+        discovered["11:22:33:44:55:66"] = (
+            SimpleNamespace(address="11:22:33:44:55:66", name=None),
+            SimpleNamespace(
+                service_data={EDDYSTONE_SERVICE_UUID: b"\x40" + b"\x00" * 20},
+                rssi=-40,
+            ),
+        )
+        before_addr = coordinator.address
+        coordinator._async_poll_discovered(datetime.now(timezone.utc))
+        await hass.async_block_till_done()
+        assert coordinator.address == before_addr
+        assert coordinator.rssi == -54  # not overwritten by the other device
+
+        # -127 RSSI (BlueZ placeholder for paired-but-absent) is ignored.
+        discovered[address] = (
+            SimpleNamespace(address=address, name=None),
+            SimpleNamespace(service_data={EDDYSTONE_SERVICE_UUID: ad}, rssi=-127),
+        )
+        before_seen = coordinator.last_seen
+        coordinator._async_poll_discovered(datetime.now(timezone.utc))
+        await hass.async_block_till_done()
+        assert coordinator.last_seen == before_seen
+
+        # A stale cached ad (older than the presence timeout) must NOT keep
+        # presence alive — otherwise a pre-boot entry would falsely re-arm.
+        from bluetooth_data_tools import monotonic_time_coarse
+
+        class _StaleScanner(_PollingScanner):
+            @property
+            def discovered_device_timestamps(self):
+                return {address: monotonic_time_coarse() - 3600}
+
+        with patch(
+            "custom_components.ha_findmy_offline_tag_tracker.coordinator."
+            "_get_manager",
+            lambda hass: SimpleNamespace(
+                async_register_advertisement_callback=(
+                    lambda cb, addr, *a, **k: (lambda: None)
+                ),
+                async_current_scanners=lambda: [_StaleScanner()],
+            ),
+        ):
+            coordinator._is_home = False
+            coordinator._last_seen = None
+            coordinator._async_poll_discovered(datetime.now(timezone.utc))
+            await hass.async_block_till_done()
+            assert coordinator.is_home is False
+            assert coordinator.last_seen is None

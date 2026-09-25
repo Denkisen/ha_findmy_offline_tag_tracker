@@ -1,5 +1,7 @@
 """Constants for the Find My Offline Tag Tracker (Loshall Tag) integration."""
 
+from datetime import timedelta
+
 from homeassistant.const import Platform
 
 DOMAIN = "ha_findmy_offline_tag_tracker"
@@ -33,5 +35,13 @@ MAX_TRACKED_ROTATIONS = 90
 # plus its normal ad cadence (16–92 s observed), so the backstop itself never
 # false-flips an in-range tag across a rotation. 600 s sits well above both.
 DEFAULT_PRESENCE_TIMEOUT = 600  # s
+
+# How often the coordinator pulls the bluetooth scanner's discovered-devices
+# cache to look for the tag (see ``_async_poll_discovered`` in coordinator.py).
+# This is the liveness backbone: unlike push callbacks it works even when the
+# per-address advertisement callback is not delivered, and it lets the
+# coordinator learn the tag's *current* MAC within one interval after a HA
+# restart (the push callbacks can take up to a full EID rotation).
+PRESENCE_POLL_INTERVAL = timedelta(seconds=30)
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]

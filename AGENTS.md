@@ -20,19 +20,27 @@ Ephemeral Identity (EID) against the user's provisioning key material.
   (`ROTATION_PERIOD`), so the stable identity for `device_info`/`unique_id` is
   the ephemeral identity key (EID), not the MAC. MAC is exposed only as an
   attribute.
-- **Presence "stays in range" is driven by a *per-address advertisement
-  callback*, not the service-UUID callback.** The service-UUID callback is
-  throttled by habluetooth's identical-`service_data` dedup (it fires at most
-  once per 1024 s EID rotation), but the manager API
-  `_get_manager(hass).async_register_advertisement_callback(cb, address)` fires
-  on **every** advertisement from a known address, *including unchanged
-  payloads* — it is dispatched before the dedup short-circuit in
-  `habluetooth/manager.py`. The coordinator registers it for the tag's *current*
-  MAC and **re-points it on every MAC change**, exactly like the unavailable
-  tracker. This keeps `last_seen`/RSSI fresh at the tag's real ad cadence
-  (16–92 s observed) so the tag never falsely flips "away" across a rotation —
-  the same behavior a raw `bleak` scanner (e.g. `fhn_track.py`) has, but inside
-  HA with no sidecar and no MQTT.
+- **Presence "stays in range" is driven by a *30 s poll of the
+  scanner's discovered-devices cache*, not the service-UUID callback.**
+  The service-UUID callback is throttled by habluetooth's identical-
+  `service_data` dedup (it fires at most once per 1024 s EID rotation), and
+  the per-address advertisement callback, while dispatched before the dedup
+  short-circuit, proved unreliable on this deployment (ads reached the
+  coordinator only every 8–30 min). The coordinator therefore also re-scans
+  `scanner.discovered_devices_and_advertisement_data` (via
+  `_get_manager(hass).async_current_scanners()`) every 30 s, EID-matching
+  each cached payload — the same pull pattern Bermuda uses. This keeps
+  `last_seen`/RSSI fresh at the tag's real ad cadence (16–92 s observed),
+  re-learns the MAC after a HA restart within one interval, and catches MAC
+  rotations the push callbacks swallowed. Cache entries are freshness-filtered
+  against `discovered_device_timestamps` (monotonic; negative age = restored
+  from a previous boot) and capped at the presence timeout.
+- **The per-address advertisement callback and the Eddystone service-UUID
+  callback are kept as fast-path secondary signals** (instant arrival /
+  MAC-change detection between polls). They are registered through the
+  bluetooth manager: `_get_manager(hass).async_register_advertisement_callback(
+  cb, address)` (manager method, *not* in `bluetooth.__all__`), re-pointed on
+  every MAC change exactly like the unavailable tracker.
 - **`DEFAULT_PRESENCE_TIMEOUT` (600 s) is a *backstop* only.** Because the
   per-address ad callback above keeps `last_seen` fresh every ad, the timeout
   only catches the edge where neither the per-address signal nor the
