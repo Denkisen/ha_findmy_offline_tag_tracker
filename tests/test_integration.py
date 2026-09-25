@@ -559,6 +559,120 @@ async def test_poll_keeps_presence_fresh_and_relearns_mac(
             assert coordinator.last_seen is None
 
 
+async def test_two_tags_are_tracked_independently(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """Multiple tags = multiple config entries; each is matched by EID.
+
+    Both tags advertise under the same Eddystone UUID, so the single shared
+    service-UUID callback must route each advertisement to exactly the entry
+    whose rolling EID window matches.
+    """
+    from ha_findmy_offline_tag_tracker import fhn_codec
+
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    eik_a = bytes.fromhex(EIK_HEX)
+    eik_b = bytes.fromhex("11" * 32)  # different 32-byte AES key (secp160r1)
+
+    def _entry(name: str, clock: str, eik_hex: str) -> MockConfigEntry:
+        return MockConfigEntry(
+            domain=DOMAIN,
+            title=name,
+            data={
+                "name": name,
+                "clock_offset": clock,
+                "curve": CURVE,
+                "ephemeral_identity_key": eik_hex,
+            },
+            unique_id=None,
+        )
+
+    entry_a = _entry("Tag A", CLOCK_OFFSET, EIK_HEX)
+    entry_a.add_to_hass(hass)
+    entry_b = _entry("Tag B", "17000001.5", eik_b.hex())
+    entry_b.add_to_hass(hass)
+
+    # Both entries are added before setup: HA loads every entry of a domain
+    # when the first one is set up.
+    assert await hass.config_entries.async_setup(entry_a.entry_id)
+    await hass.async_block_till_done()
+
+    all_states = list(hass.states.async_entity_ids())
+    presence = sorted(e for e in all_states if e.startswith("binary_sensor."))
+    trackers = sorted(e for e in all_states if e.startswith("device_tracker."))
+    assert len(presence) == 2, all_states
+    assert len(trackers) == 2, all_states
+    rssi = sorted(e for e in all_states if e.startswith("sensor.") and "rssi" in e)
+    assert len(rssi) == 2, all_states
+
+    # Each entry registers its own service-UUID callback; every ad is
+    # delivered to both, and each coordinator matches only its own EID.
+    uuid_regs = [c for c in ble_register_stub if "match_dict" in c]
+    assert len(uuid_regs) == 2
+    callbacks = [c["callback"] for c in uuid_regs]
+
+    def deliver(service_info) -> None:
+        for cb in callbacks:
+            cb(service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
+
+    # Tag B advertises (distinct MAC). Only Tag B's entities flip.
+    beacon_b = fhn_codec.FHNBeacon(
+        float("17000001.5"), fhn_codec.SECP160R1, eik_b, "Tag B"
+    )
+    ad_b = b"\x40" + beacon_b.generate_eid(datetime.now(timezone.utc).timestamp())
+    deliver(
+        SimpleNamespace(
+            service_data={EDDYSTONE_SERVICE_UUID: ad_b},
+            rssi=-50,
+            address="AA:00:00:00:00:02",
+        )
+    )
+    await hass.async_block_till_done()
+
+    assert entry_a.runtime_data.is_home is False
+    assert entry_b.runtime_data.is_home is True
+    assert entry_b.runtime_data.address == "AA:00:00:00:00:02"
+    # Per-entity states follow their own coordinator.
+    on_entities = [e for e in presence if hass.states.get(e).state == "on"]
+    assert len(on_entities) == 1, [
+        (e, hass.states.get(e).state) for e in presence
+    ]
+    on_trackers = [e for e in trackers if hass.states.get(e).state == "home"]
+    assert len(on_trackers) == 1
+
+    # Tag A advertising now: its entities flip, Tag B's stay on.
+    ad_a = _current_advertisement(eik_a)
+    deliver(
+        SimpleNamespace(
+            service_data={EDDYSTONE_SERVICE_UUID: ad_a},
+            rssi=-70,
+            address="BB:00:00:00:00:01",
+        )
+    )
+    await hass.async_block_till_done()
+
+    assert entry_a.runtime_data.is_home is True
+    assert entry_b.runtime_data.is_home is True
+    on_entities = [e for e in presence if hass.states.get(e).state == "on"]
+    assert len(on_entities) == 2
+    on_trackers = [e for e in trackers if hass.states.get(e).state == "home"]
+    assert len(on_trackers) == 2
+
+    # Tag A leaving (timeout) does not affect Tag B.
+    timeout = entry_a.options.get("presence_timeout", DEFAULT_PRESENCE_TIMEOUT)
+    entry_a.runtime_data._last_seen = datetime.now(timezone.utc) - timedelta(
+        seconds=timeout + 1
+    )
+    entry_a.runtime_data._async_check_presence(datetime.now(timezone.utc))
+    await hass.async_block_till_done()
+
+    assert entry_a.runtime_data.is_home is False
+    assert entry_b.runtime_data.is_home is True
+    on_trackers = [e for e in trackers if hass.states.get(e).state == "home"]
+    assert len(on_trackers) == 1
+
+
 async def test_device_tracker_entity_reflects_presence(
     hass: HomeAssistant, enable_custom_integrations, ble_register_stub
 ) -> None:

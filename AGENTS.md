@@ -6,6 +6,13 @@ verifies its rotating Ephemeral Identity (EID) against the user's
 provisioning key material.
 
 ## Comments
+- **Multiple tags = multiple config entries.** Each entry builds its own
+  `TrackedBeacon` + `TagCoordinator` and registers its own BLE callbacks; HA
+  loads every entry of the domain when the first one is set up. Every
+  advertisement is delivered to *all* entries' callbacks, and each
+  coordinator's EID window match is what routes it to exactly one tag — a
+  foreign tag's Eddystone payload never matches, so tags can't cross-talk.
+  Verified by `test_two_tags_are_tracked_independently`.
 - The EC point math lives in **`ec.py` (pure Python)** instead of using
   `fastecdsa`. `fastecdsa` 4.x is a compiled/Rust wheel that has no build
   path on Home Assistant OS, and pinning `cryptography` (which HA Core already
