@@ -21,11 +21,17 @@ MAX_TRACKED_ROTATIONS = 90
 # After this many seconds without a matching advertisement, the tag is
 # considered no longer in range.
 #
-# This MUST be larger than ROTATION_PERIOD: Home Assistant's bluetooth manager
-# (habluetooth) suppresses advertisements whose service_data is unchanged, and
-# the tag's Eddystone payload only changes when the EID rotates. So the
-# callback fires at most once every ROTATION_PERIOD seconds, and any timeout
-# below that would flip the tag "away" on every rotation even while in range.
-DEFAULT_PRESENCE_TIMEOUT = ROTATION_PERIOD * 2  # 2048 s
+# This is a *backstop* only. The coordinator also follows a per-address
+# advertisement callback (which fires on every ad, unchanged payloads
+# included) and HA's per-address unavailable signal, so ``last_seen`` stays
+# fresh at the tag's real ad cadence and a real departure flips "away" via the
+# unavailable event (~5 min). The timeout only catches the edge where neither
+# per-address signal fired.
+#
+# It must stay comfortably above the beacon's worst-case *rotation silence*
+# (observed ~148 s, and slowly growing as the beacon's stored clock drifts)
+# plus its normal ad cadence (16–92 s observed), so the backstop itself never
+# false-flips an in-range tag across a rotation. 600 s sits well above both.
+DEFAULT_PRESENCE_TIMEOUT = 600  # s
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]

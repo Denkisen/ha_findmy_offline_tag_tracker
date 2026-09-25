@@ -10,10 +10,19 @@ This mirrors the pattern used by built-in passive-BLE integrations such as
 a plain object that calls the synchronous ``async_register_callback`` and
 tracks its unsubs in ``_on_stop``.
 
-In addition to matching advertisements, the coordinator follows HA's
-per-address *unavailable* signal for the tag's current MAC (re-pointing it on
-every MAC change) so a real departure flips presence OFF in ~5 min instead of
-waiting for the long presence-timeout backstop — see AGENTS.md for the why.
+In addition to matching advertisements, the coordinator follows two per-address
+signals for the tag's current MAC, re-pointing both whenever the MAC changes:
+
+* a **per-address advertisement callback**
+  (``_get_manager(hass).async_register_advertisement_callback``) — unlike the
+  service-UUID callback above, it fires on *every* advertisement from the
+  address, including payloads unchanged since the last one. This keeps
+  ``last_seen``/RSSI fresh at the tag's real ad cadence, so the tag never
+  falsely flips "away" while in range and arrival is instant;
+* HA's **per-address unavailable** signal (``async_track_unavailable``), which
+  fires when the address stops advertising — a real "tag left" edge that
+  flips presence OFF in ~5 min instead of waiting for the presence-timeout
+  backstop. See AGENTS.md for the why.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from homeassistant.components.bluetooth import (
     async_register_callback,
     async_track_unavailable,
 )
+from homeassistant.components.bluetooth.api import _get_manager
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
@@ -69,6 +79,7 @@ class TagCoordinator:
         self._address: Optional[str] = None
         self._is_home = False
         self._unsub_unavailable: Optional[Callable[[], None]] = None
+        self._unsub_advertisement: Optional[Callable[[], None]] = None
 
     # ------------------------------------------------------------------ #
     # Listener management
@@ -91,23 +102,52 @@ class TagCoordinator:
     # Bluetooth
     # ------------------------------------------------------------------ #
     @callback
+    def _async_mark_seen(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Refresh presence from a confirmed advertisement of the tag.
+
+        Shared by the Eddystone-UUID callback (which EID-matches first) and the
+        per-address callback (which trusts the tracked address). Updates
+        last_seen/RSSI, re-points the per-address trackers on a MAC change, and
+        flips in-range ON.
+        """
+        now = datetime.now(timezone.utc)
+        self._last_seen = now
+        self._rssi = service_info.rssi
+        address = service_info.address
+        if address != self._address:
+            self._address = address
+            self._async_track_address_unavailable(address)
+            self._async_track_address_advertisements(address)
+        if not self._is_home:
+            self._is_home = True
+        self._notify()
+
+    @callback
     def _async_handle_advertisement(
         self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
+        """Service-UUID callback: EID-matches, so it also detects MAC rotations."""
         advertisement = service_info.service_data.get(EDDYSTONE_SERVICE_UUID)
         if advertisement is None:
             return
         now = datetime.now(timezone.utc)
         if self.tracker.match(advertisement, now):
-            self._last_seen = now
-            self._rssi = service_info.rssi
-            address = service_info.address
-            if address != self._address:
-                self._address = address
-                self._async_track_address_unavailable(address)
-            if not self._is_home:
-                self._is_home = True
-            self._notify()
+            self._async_mark_seen(service_info)
+
+    @callback
+    def _async_handle_per_address_advertisement(
+        self, service_info: BluetoothServiceInfoBleak
+    ) -> None:
+        """Per-address callback: fires on *every* ad from the tracked address.
+
+        Includes payloads unchanged since the last one, so ``last_seen`` stays
+        fresh at the tag's real ad cadence and the tag never falsely flips
+        "away" mid-rotation. We only register this for an address we already
+        EID-matched, so any ad from it is the tag — no re-match needed.
+        """
+        if service_info.address != self._address:
+            return  # stale: the tag has already moved to a newer address
+        self._async_mark_seen(service_info)
 
     def _async_track_address_unavailable(self, address: str) -> None:
         """Follow HA's per-address "device gone" signal for the current tag address.
@@ -130,6 +170,22 @@ class TagCoordinator:
 
         self._unsub_unavailable = async_track_unavailable(
             self.hass, _unavailable, address, connectable=False
+        )
+
+    def _async_track_address_advertisements(self, address: str) -> None:
+        """Follow *every* advertisement from the current tag address.
+
+        The service-UUID callback above is throttled by habluetooth's identical-
+        ``service_data`` dedup, so it only fires once per EID rotation (1024 s).
+        This per-address callback fires on every ad from ``address`` (including
+        unchanged payloads) — the same cadence a raw ``bleak`` scanner sees —
+        keeping ``last_seen``/RSSI fresh while the tag is in range. Re-pointed
+        on every MAC change, just like the unavailable tracker.
+        """
+        if self._unsub_advertisement is not None:
+            self._unsub_advertisement()
+        self._unsub_advertisement = _get_manager(self.hass).async_register_advertisement_callback(
+            self._async_handle_per_address_advertisement, address
         )
 
     @callback
@@ -161,6 +217,9 @@ class TagCoordinator:
         if self._unsub_unavailable is not None:
             self._unsub_unavailable()
             self._unsub_unavailable = None
+        if self._unsub_advertisement is not None:
+            self._unsub_advertisement()
+            self._unsub_advertisement = None
         self._listeners.clear()
 
     @callback

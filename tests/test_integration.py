@@ -76,6 +76,21 @@ def ble_register_stub():
 
         return _unsub
 
+    # The per-address advertisement callback is registered through the
+    # bluetooth manager, which we stub via _get_manager (no BlueZ in tests).
+    # Registrations land in the same `calls` list, tagged "advertisement".
+    class _FakeManager:
+        def async_register_advertisement_callback(self, callback, address, *a, **k):
+            calls.append({"advertisement": address, "callback": callback})
+
+            def _unsub():
+                calls[-1]["unsubscribed"] = True
+
+            return _unsub
+
+    def _fake_get_manager(hass):
+        return _FakeManager()
+
     with (
         patch(
             "custom_components.ha_findmy_offline_tag_tracker.coordinator.async_register_callback",
@@ -84,6 +99,10 @@ def ble_register_stub():
         patch(
             "custom_components.ha_findmy_offline_tag_tracker.coordinator.async_track_unavailable",
             _fake_track_unavailable,
+        ),
+        patch(
+            "custom_components.ha_findmy_offline_tag_tracker.coordinator._get_manager",
+            _fake_get_manager,
         ),
     ):
         yield calls
@@ -106,12 +125,10 @@ async def test_full_setup_and_advertisement(
     await hass.async_block_till_done()
 
     # The BLE callback was registered with the Eddystone service-data filter.
-    assert len(ble_register_stub) == 1
-    assert (
-        ble_register_stub[0]["match_dict"]["service_data_uuid"]
-        == EDDYSTONE_SERVICE_UUID
-    )
-    callback = ble_register_stub[0]["callback"]
+    uuid_regs = [c for c in ble_register_stub if "match_dict" in c]
+    assert len(uuid_regs) == 1
+    assert uuid_regs[0]["match_dict"]["service_data_uuid"] == EDDYSTONE_SERVICE_UUID
+    callback = uuid_regs[0]["callback"]
 
     # Both platforms created entities.
     all_states = list(hass.states.async_entity_ids())
@@ -250,7 +267,7 @@ async def test_unavailable_signal_flips_presence_off(
     await hass.async_block_till_done()
 
     coordinator = entry.runtime_data
-    callback = ble_register_stub[0]["callback"]
+    callback = next(c["callback"] for c in ble_register_stub if "match_dict" in c)
 
     # Bring the tag in range.
     eik = bytes.fromhex(EIK_HEX)
@@ -282,4 +299,115 @@ async def test_unavailable_signal_flips_presence_off(
     assert coordinator.is_home is True
     unavailable_cb(SimpleNamespace(address="OLD:ADDRESS:00:00:00"))
     await hass.async_block_till_done()
+    assert coordinator.is_home is True
+
+
+async def test_per_address_advertisement_keeps_presence_fresh(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """The per-address ad callback fires on every ad and keeps the tag in range.
+
+    This is the fast-detection path: even when the Eddystone payload is
+    unchanged (so the service-UUID callback is dedup'd), a per-address ad from
+    the tracked MAC refreshes last_seen and keeps presence ON. A stale ad from
+    an old MAC is ignored.
+    """
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Loshall Tag 1",
+        data=_entry_data(),
+        unique_id=None,
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = entry.runtime_data
+    uuid_cb = next(c["callback"] for c in ble_register_stub if "match_dict" in c)
+
+    # First sight via the service-UUID callback (EID match) registers a
+    # per-address advertisement tracker for the tag's MAC.
+    address = "AA:BB:CC:DD:EE:FF"
+    eik = bytes.fromhex(EIK_HEX)
+    ad = _current_advertisement(eik)
+    service_info = SimpleNamespace(
+        service_data={EDDYSTONE_SERVICE_UUID: ad}, rssi=-50, address=address
+    )
+    uuid_cb(service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
+    await hass.async_block_till_done()
+
+    ad_regs = [c for c in ble_register_stub if "advertisement" in c]
+    assert any(c["advertisement"] == address for c in ad_regs), ad_regs
+    ad_cb = next(c["callback"] for c in ad_regs if c["advertisement"] == address)
+
+    # The tag is in range.
+    assert coordinator.is_home is True
+    seen_before = coordinator.last_seen
+    assert seen_before is not None
+
+    # A per-address ad with an UNCHANGED payload still refreshes last_seen and
+    # keeps presence ON (the service-UUID callback would not have fired again).
+    coordinator._last_seen = datetime.now(timezone.utc) - timedelta(seconds=300)
+    ad_cb(SimpleNamespace(service_data={EDDYSTONE_SERVICE_UUID: ad}, rssi=-48, address=address))
+    await hass.async_block_till_done()
+    assert coordinator.is_home is True
+    assert coordinator.last_seen > seen_before
+    assert coordinator.rssi == -48
+
+    # A per-address ad from an OLD (already-replaced) MAC is ignored: it must
+    # not refresh presence or re-point the tracker.
+    old_addr = "11:22:33:44:55:66"
+    before = coordinator.last_seen
+    coordinator._async_handle_per_address_advertisement(
+        SimpleNamespace(service_data={}, rssi=-90, address=old_addr)
+    )
+    await hass.async_block_till_done()
+    assert coordinator.address == address
+    assert coordinator.last_seen == before
+
+
+async def test_mac_rotation_repoints_advertisement_tracker(
+    hass: HomeAssistant, enable_custom_integrations, ble_register_stub
+) -> None:
+    """When the tag rotates to a new MAC, the per-address tracker re-points."""
+    assert await async_setup_component(hass, "bluetooth", {})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Loshall Tag 1",
+        data=_entry_data(),
+        unique_id=None,
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = entry.runtime_data
+    uuid_cb = next(c["callback"] for c in ble_register_stub if "match_dict" in c)
+    eik = bytes.fromhex(EIK_HEX)
+    ad = _current_advertisement(eik)
+
+    mac1 = "AA:BB:CC:00:00:01"
+    uuid_cb(
+        SimpleNamespace(service_data={EDDYSTONE_SERVICE_UUID: ad}, rssi=-50, address=mac1),
+        bluetooth.BluetoothChange.ADVERTISEMENT,
+    )
+    await hass.async_block_till_done()
+    assert coordinator.address == mac1
+
+    # Rotation: same EID, new MAC. The EID match still succeeds, so the tag is
+    # tracked under the new address and the per-address tracker re-points.
+    mac2 = "AA:BB:CC:00:00:02"
+    uuid_cb(
+        SimpleNamespace(service_data={EDDYSTONE_SERVICE_UUID: ad}, rssi=-52, address=mac2),
+        bluetooth.BluetoothChange.ADVERTISEMENT,
+    )
+    await hass.async_block_till_done()
+    assert coordinator.address == mac2
+    ad_regs = [c for c in ble_register_stub if "advertisement" in c]
+    assert any(c["advertisement"] == mac2 for c in ad_regs), ad_regs
     assert coordinator.is_home is True
