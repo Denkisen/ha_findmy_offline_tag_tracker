@@ -1,6 +1,6 @@
 {
   "domain": "ha_findmy_offline_tag_tracker",
-  "name": "Find My Offline Tag Tracker (Loshall Tag)",
+  "name": "Find My Tag Tracker",
   "version": "1.0.0",
   "codeowners": ["@Denkisen"],
   "config_flow": true,

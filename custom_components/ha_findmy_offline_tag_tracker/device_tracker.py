@@ -27,14 +27,14 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TagCoordinator = entry.runtime_data
-    async_add_entities([LoshallTag(entry, coordinator)])
+    async_add_entities([FindMyTag(entry, coordinator)])
 
 
-class LoshallTag(BaseScannerEntity, RestoreEntity):
-    """Tracker entity for one Loshall Tag's Bluetooth presence."""
+class FindMyTag(BaseScannerEntity, RestoreEntity):
+    """Tracker entity for one Find My tag's Bluetooth presence."""
 
     _attr_has_entity_name = True
-    _attr_name = "Loshall Tag"
+    _attr_name = "Tag"
     _attr_source_type = SourceType.BLUETOOTH_LE
     _attr_should_poll = False
 

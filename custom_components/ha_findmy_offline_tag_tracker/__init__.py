@@ -1,4 +1,5 @@
-"""The Find My Offline Tag Tracker (Loshall Tag) integration."""
+"""The Find My Tag Tracker integration (Loshall Tag, Tile, and any other
+Find My / Find Hub Network beacon, given its provisioning key material)."""
 
 from __future__ import annotations
 

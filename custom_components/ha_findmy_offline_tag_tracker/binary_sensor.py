@@ -24,10 +24,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TagCoordinator = entry.runtime_data
-    async_add_entities([LoshallTagPresence(entry, coordinator)])
+    async_add_entities([FindMyTagPresence(entry, coordinator)])
 
 
-class LoshallTagPresence(BinarySensorEntity, RestoreEntity):
+class FindMyTagPresence(BinarySensorEntity, RestoreEntity):
     """Reports whether the tag is currently in Bluetooth range."""
 
     _attr_has_entity_name = True

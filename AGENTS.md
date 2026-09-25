@@ -1,8 +1,9 @@
 # AGENTS.md — ha_findmy_offline_tag_tracker
 
-Home Assistant custom integration that passively tracks a **Loshall Tag**
-(Find Hub Network / "Find My" beacon) by BLE and verifies its rotating
-Ephemeral Identity (EID) against the user's provisioning key material.
+Home Assistant custom integration that passively tracks a **Find My tag**
+(any Find Hub Network / "Find My" beacon — Loshall Tag, Tile, …) by BLE and
+verifies its rotating Ephemeral Identity (EID) against the user's
+provisioning key material.
 
 ## Comments
 - The EC point math lives in **`ec.py` (pure Python)** instead of using

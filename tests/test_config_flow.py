@@ -1,4 +1,4 @@
-"""Config flow tests for the Loshall Tag integration."""
+"""Config flow tests for the Find My Tag Tracker integration."""
 
 from __future__ import annotations
 

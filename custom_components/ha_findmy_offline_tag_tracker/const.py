@@ -1,4 +1,4 @@
-"""Constants for the Find My Offline Tag Tracker (Loshall Tag) integration."""
+"""Constants for the Find My Tag Tracker integration."""
 
 from datetime import timedelta
 
@@ -6,8 +6,8 @@ from homeassistant.const import Platform
 
 DOMAIN = "ha_findmy_offline_tag_tracker"
 
-# Eddystone service data UUID. Loshall Tag (and other FHN beacons) advertise
-# their Ephemeral Identity (EID) as Eddystone service data under this UUID.
+# Eddystone service data UUID. Find My (FHN) beacons advertise their
+# Ephemeral Identity (EID) as Eddystone service data under this UUID.
 EDDYSTONE_SERVICE_UUID = "0000feaa-0000-1000-8000-00805f9b34fb"
 
 # The FHN Accessory Specification rotates the EID every 2^10 seconds.

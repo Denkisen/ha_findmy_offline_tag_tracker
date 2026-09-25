@@ -1,4 +1,4 @@
-"""Config flow for the Find My Offline Tag Tracker (Loshall Tag) integration."""
+"""Config flow for the Find My Tag Tracker integration."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ USER_SCHEMA = vol.Schema(
 
 
 class ConfigFlowHandler(ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for the Loshall Tag integration."""
+    """Handle a config flow for the Find My Tag Tracker integration."""
 
     VERSION = 1
 
@@ -106,7 +106,7 @@ class ConfigFlowHandler(ConfigFlow, domain=DOMAIN):
 
 
 class OptionsFlowHandler(OptionsFlow):
-    """Handle options for the Loshall Tag integration."""
+    """Handle options for the Find My Tag Tracker integration."""
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         # `OptionsFlow.config_entry` is a read-only property; store a copy.

@@ -341,8 +341,8 @@ class TagCoordinator:
             "name": self._name,
             "identifiers": {(DOMAIN, self._eid_hex)},
             "connections": {(CONNECTION_BLUETOOTH, self._name.lower())},
-            "manufacturer": "Loshall",
-            "model": "Loshall Tag",
+            "manufacturer": "Find My",
+            "model": "Find My Tag",
         }
 
     @property

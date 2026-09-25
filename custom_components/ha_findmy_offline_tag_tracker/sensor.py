@@ -26,13 +26,13 @@ async def async_setup_entry(
     coordinator: TagCoordinator = entry.runtime_data
     async_add_entities(
         [
-            LoshallTagRssi(entry, coordinator),
-            LoshallTagLastSeen(entry, coordinator),
+            FindMyTagRssi(entry, coordinator),
+            FindMyTagLastSeen(entry, coordinator),
         ]
     )
 
 
-class _LoshallTagSensor(SensorEntity):
+class _FindMyTagSensor(SensorEntity):
     """Base class for tag sensors that subscribe to coordinator updates."""
 
     _attr_should_poll = False
@@ -56,7 +56,7 @@ class _LoshallTagSensor(SensorEntity):
         self.async_write_ha_state()
 
 
-class LoshallTagRssi(_LoshallTagSensor):
+class FindMyTagRssi(_FindMyTagSensor):
     """Report the RSSI of the last matching advertisement."""
 
     _attr_name = "RSSI"
@@ -77,7 +77,7 @@ class LoshallTagRssi(_LoshallTagSensor):
         return self._coordinator.rssi is not None
 
 
-class LoshallTagLastSeen(_LoshallTagSensor):
+class FindMyTagLastSeen(_FindMyTagSensor):
     """Report when the tag was last seen in range."""
 
     _attr_name = "Last Seen"
