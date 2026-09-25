@@ -154,6 +154,33 @@ def test_window_grows_and_stays_bounded():
     assert len(tracked._eids) <= size_after_init + 5
 
 
+def test_match_stays_current_through_many_rotations_and_clock_drift():
+    """Regression: the window must keep matching the beacon's *current* EID
+    for hours of continuous operation, even when the beacon's stored clock
+    runs ahead of wall time.
+
+    Before the window re-anchoring fix, the slide only appended a single
+    "now" entry, so the front edge lagged the beacon's ahead-shifted current
+    period and matching stopped after ~80-150 minutes — the tag falsely
+    flipped away while still advertising.
+    """
+    beacon = _beacon()
+    start = _now()
+    tracked = fhn_codec.TrackedBeacon(beacon, start)
+    # The beacon's stored clock can run ahead of wall time; the broadcast EID
+    # at wall time ``t`` is the one for ``t + drift``. Exercise a range of
+    # drifts, including full-period offsets, across 3+ hours of 30 s polls.
+    for drift in (0, 300, 624, 1023, 1024, 2047):
+        for step in range(400):
+            now = start + timedelta(seconds=step * 30)
+            broadcast = beacon.generate_eid(now.timestamp() + drift)
+            assert tracked.match(b"\x40" + broadcast, now), (
+                f"missed the tag at step {step} with drift {drift}s"
+            )
+    # The window must remain bounded after all the re-anchoring.
+    assert len(tracked._eids) <= 95
+
+
 def test_curve_for_name():
     assert fhn_codec.curve_for_name("secp160r1") is fhn_codec.SECP160R1
     assert fhn_codec.curve_for_name("secp256r1") is fhn_codec.SECP256R1

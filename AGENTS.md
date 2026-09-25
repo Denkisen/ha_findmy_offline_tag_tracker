@@ -92,5 +92,23 @@ provisioning key material.
   service-UUID callback's EID match landing on a new address (the per-address
   callback alone cannot see a *new* MAC, because it is registered per
   address).
+- **`TrackedBeacon.match()` must slide the EID window's front forward one
+  full window per evicted entry, not append a single "now" entry.** The
+  beacon's stored clock runs slightly ahead of wall time, so the EID it
+  broadcasts at wall time `t` is the one for period `P(t)+1`. The window's
+  back edge is `now - MAX_CLOCK_SKEW` and must reach `~MAX_TRACKED_ROTATIONS`
+  periods *ahead* of that. Appending only a "now" entry left the front edge
+  one period short of the beacon's ahead-shifted current period, so after an
+  EID rotation `match()` returned False **permanently** (the tag was still
+  advertising, but the 30 s poll could no longer see it). That was the real
+  cause of the "Away for 35 min after restart" bug: the poll stopped
+  re-matching the rotated tag, so (a) `last_seen` went stale and (b) the
+  stale per-address *unavailable* event for the old MAC was no longer
+  superseded by a fresh match, so it wrongly flipped the tag away. Sliding
+  one period per eviction keeps the front ahead, is O(1) EC work per slide
+  (one per ~1024 s, not 90 per poll), and lets the poll re-learn the rotated
+  MAC within one 30 s interval — which re-points the unavailable tracker and
+  makes the address guard reject the old MAC's stale unavailable event.
+  Covered by `test_match_stays_current_through_many_rotations_and_clock_drift`.
 - All datetimes are **timezone-aware UTC** (required by the TIMESTAMP sensor
   and for correct EID epoch computation). Do not introduce naive `datetime.now()`.

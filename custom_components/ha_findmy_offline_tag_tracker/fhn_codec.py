@@ -124,12 +124,24 @@ class TrackedBeacon:
         if advertisement[0] not in (0x40, 0x41):
             return False
         min_adv_time = now - timedelta(seconds=MAX_CLOCK_SKEW_SECONDS)
-        # Evict stale entries, then extend the window forward one step.
-        expired = [eid for eid, adv_time in self._eids.items() if adv_time < min_adv_time]
-        for eid in expired:
-            del self._eids[eid]
-        if expired:
-            self._eids[self._beacon.generate_eid(now.timestamp())] = now
+        # Evict entries that have fallen behind the skew window. For each
+        # eviction, advance the window's *front* one full window ahead (one
+        # period per expired entry), mirroring the reference implementation.
+        # This forward extension is what keeps the front comfortably ahead of
+        # the beacon's *current* period even when the beacon's stored clock
+        # runs slightly ahead of wall time. The earlier port appended a single
+        # "now" entry instead, so the front lagged the beacon's ahead-shifted
+        # period and, after an EID rotation, the poll stopped matching the tag
+        # and it falsely flipped away.
+        # Sort by adv_time so we can stop at the first non-expired entry
+        # (the reference relies on OrderedDict insertion order; a plain dict
+        # has no such guarantee, so we sort explicitly).
+        for old_eid, adv_time in sorted(self._eids.items(), key=lambda kv: kv[1]):
+            if adv_time >= min_adv_time:
+                break
+            del self._eids[old_eid]
+            adv_time += timedelta(seconds=MAX_TRACKED_ROTATIONS * ROTATION_PERIOD)
+            self._eids[self._beacon.generate_eid(adv_time.timestamp())] = adv_time
         eid = advertisement[1 : 1 + eid_length]
         if eid in self._eids:
             self.last_seen = now
