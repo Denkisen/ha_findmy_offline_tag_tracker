@@ -147,11 +147,91 @@ def test_window_grows_and_stays_bounded():
     start = _now()
     tracked = fhn_codec.TrackedBeacon(beacon, start)
     size_after_init = len(tracked._eids)
+    # The seeded window spans one day behind and one day ahead of "now".
+    assert size_after_init == 2 * 86400 // 1024 + 1
     # Advance time so some entries expire; the window must grow forward and
-    # not grow without bound.
+    # not grow without bound (front is capped at 2 days ahead of wall time).
     later = start + timedelta(days=3)
     tracked.match(b"\x40" + beacon.generate_eid(later.timestamp()), later)
-    assert len(tracked._eids) <= size_after_init + 5
+    max_span_seconds = 3 * 86400  # back edge to capped front
+    assert len(tracked._eids) <= max_span_seconds // 1024 + 2
+
+
+def test_match_bootstraps_ahead_drifted_clock_on_first_poll():
+    """Regression: a beacon whose stored clock is ALREADY hours ahead of
+    wall time must match on the very first poll after (re)start.
+
+    This is the re-acquisition case: after the old window design failed, the
+    tag sits "away" while advertising continuously; deploying the fix and
+    restarting HA must bring it back within one poll interval. The old code
+    seeded the front only ~1.3 h ahead of wall time and missed permanently.
+    """
+    beacon = _beacon()
+    start = _now()
+    tracked = fhn_codec.TrackedBeacon(beacon, start)
+    for drift in (7200, 20000, 80000):  # 2 h, 5.5 h, 22 h ahead
+        for step in range(24):  # two hours of 5-minute polls
+            now = start + timedelta(seconds=step * 300)
+            broadcast = beacon.generate_eid(now.timestamp() + drift)
+            assert tracked.match(b"\x40" + broadcast, now), (
+                f"missed the tag at step {step} with static drift {drift}s"
+            )
+        tracked = fhn_codec.TrackedBeacon(beacon, start)
+    # Window must stay bounded even with a 22 h ahead beacon clock.
+    assert len(tracked._eids) <= 3 * 86400 // 1024 + 2
+
+
+def test_match_survives_growing_drift_past_old_front_margin():
+    """Regression: a steadily drifting (running-fast) beacon clock must not
+    permanently outrun the window, even past the old front margin (~1.6 h
+    ahead of wall time).
+
+    The old design pinned the front to a fixed wall-time offset; once the
+    beacon's ahead-drift passed it, no match ever succeeded again — no
+    restart helped. The front is now re-anchored 90 periods ahead of the
+    beacon's last-seen period on every match.
+    """
+    beacon = _beacon()
+    start = _now()
+    tracked = fhn_codec.TrackedBeacon(beacon, start)
+    drift0 = 506.0  # seconds, observed in-field at an earlier capture
+    rate_ppm = 20000.0  # fast on purpose so the test crosses the threshold
+    n_steps = 4 * 86400 // 300  # four days of 5-minute polls
+    for step in range(n_steps):
+        now = start + timedelta(seconds=step * 300)
+        drift = drift0 + rate_ppm * 1e-6 * step * 300
+        broadcast = beacon.generate_eid(now.timestamp() + drift)
+        assert tracked.match(b"\x40" + broadcast, now), (
+            f"missed the tag at step {step} (drift {drift:.0f}s)"
+        )
+    # Prove we actually ran past the old permanent-failure zone (the old
+    # front margin was ~1.6 h ahead of wall time; beyond it matching failed
+    # forever).
+    old_front_margin = 90 * 1024 - 86400  # = 5760 s
+    assert drift0 + rate_ppm * 1e-6 * (n_steps - 1) * 300 > old_front_margin + 1024
+    assert len(tracked._eids) <= 3 * 86400 // 1024 + 2
+
+
+def test_estimated_clock_drift_converges():
+    """The drift estimate must contain the true drift and narrow over
+    matches (the one-period-wide interval is intersected across matches).
+    """
+    beacon = _beacon()
+    start = _now()
+    tracked = fhn_codec.TrackedBeacon(beacon, start)
+    drift = 500.0
+    estimates = []
+    for step in range(12):  # an hour of 5-minute polls
+        now = start + timedelta(seconds=step * 300)
+        broadcast = beacon.generate_eid(now.timestamp() + drift)
+        assert tracked.match(b"\x40" + broadcast, now)
+        est = tracked.estimated_clock_drift()
+        assert est is not None
+        assert est[0] <= drift <= est[1], f"estimate {est} excludes {drift}"
+        estimates.append(est)
+    first, last = estimates[0], estimates[-1]
+    assert last[1] - last[0] <= first[1] - first[0] + 1e-9  # never widens
+    assert last[1] - last[0] < 1024  # strictly narrower than one period
 
 
 def test_match_stays_current_through_many_rotations_and_clock_drift():
@@ -177,8 +257,10 @@ def test_match_stays_current_through_many_rotations_and_clock_drift():
             assert tracked.match(b"\x40" + broadcast, now), (
                 f"missed the tag at step {step} with drift {drift}s"
             )
-    # The window must remain bounded after all the re-anchoring.
-    assert len(tracked._eids) <= 95
+    # The window must remain bounded after all the re-anchoring (front is
+    # capped at 2 days ahead of wall time; the span grows with the beacon's
+    # ahead-drift, which here is at most ~2 periods).
+    assert len(tracked._eids) <= 3 * 86400 // 1024 + 2
 
 
 def test_curve_for_name():

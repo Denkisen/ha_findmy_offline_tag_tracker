@@ -85,30 +85,47 @@ provisioning key material.
   stale event/ad would wrongly flip the tag "away" mid-rotation or refresh
   presence from a wrong address.
 - **The beacon's stored `clock_offset` drifts — do NOT predict rotation
-  timing from it.** A real capture showed the schedule-computed rotation
-  boundary ~506 s away from the observed MAC change. The only reliable
+  timing from it, and assume the drift *grows*.** A real capture showed the
+  schedule-computed rotation boundary ~506 s away from the observed MAC
+  change, and the observed rotation silence slowly grows — the beacon's
+  stored clock runs ahead of wall time and runs fast. The only reliable
   rotation signal is the **MAC change itself** (the tag changes MAC exactly
   when the EID rotates). MAC rotation is therefore detected by the
   service-UUID callback's EID match landing on a new address (the per-address
   callback alone cannot see a *new* MAC, because it is registered per
   address).
-- **`TrackedBeacon.match()` must slide the EID window's front forward one
-  full window per evicted entry, not append a single "now" entry.** The
-  beacon's stored clock runs slightly ahead of wall time, so the EID it
-  broadcasts at wall time `t` is the one for period `P(t)+1`. The window's
-  back edge is `now - MAX_CLOCK_SKEW` and must reach `~MAX_TRACKED_ROTATIONS`
-  periods *ahead* of that. Appending only a "now" entry left the front edge
-  one period short of the beacon's ahead-shifted current period, so after an
-  EID rotation `match()` returned False **permanently** (the tag was still
-  advertising, but the 30 s poll could no longer see it). That was the real
-  cause of the "Away for 35 min after restart" bug: the poll stopped
-  re-matching the rotated tag, so (a) `last_seen` went stale and (b) the
-  stale per-address *unavailable* event for the old MAC was no longer
-  superseded by a fresh match, so it wrongly flipped the tag away. Sliding
-  one period per eviction keeps the front ahead, is O(1) EC work per slide
-  (one per ~1024 s, not 90 per poll), and lets the poll re-learn the rotated
-  MAC within one 30 s interval — which re-points the unavailable tracker and
-  makes the address guard reject the old MAC's stale unavailable event.
-  Covered by `test_match_stays_current_through_many_rotations_and_clock_drift`.
+- **The EID window must stay ahead of the beacon's *own* clock, not just of
+  wall time.** The beacon's EID at wall time `t` is the one for its own
+  clock period, and its stored clock runs ahead of wall time by a *growing*
+  drift. A front edge pinned to a fixed wall-time offset (the reference
+  tool's 90 periods: `now - 86400 + 90*1024 = now + 5760`) is permanently
+  outrun once the drift passes ~1.6 h: `match()` then returns False
+  **forever**, the 30 s poll can no longer see the tag, MAC re-anchoring
+  dies at the next rotation, the 600 s backstop flips the tag "away", and —
+  because a restart re-seeds the same wall-anchored window — **no restart
+  ever recovers it**. This was the real cause of the "away after some time,
+  updates were 2–5 s before that" bug. `TrackedBeacon` therefore:
+  (a) seeds the window ±1 day around "now" (covers any beacon clock up to a
+  day off at any moment, including right after a restart — the
+  re-acquisition case), (b) on every successful match pins the front to
+  `MAX_TRACKED_ROTATIONS` periods ahead of the beacon's last-seen period
+  (a drifting clock can never run past it while the beacon is observed), and
+  (c) caps the front at 2 days ahead of wall time so the window stays
+  bounded (≤ ~3 days of periods). The match also narrows a drift estimate
+  (`estimated_clock_drift()`, intervals intersected across matches) which
+  the coordinator logs. Covered by
+  `test_match_survives_growing_drift_past_old_front_margin`,
+  `test_match_bootstraps_ahead_drifted_clock_on_first_poll`, and
+  `test_estimated_clock_drift_converges`.
+- **On-box diagnostics live in the coordinator logs, not the recorder.**
+  To get real data from the box, set
+  `logger: {custom_components.ha_findmy_offline_tag_tracker: debug}` and
+  watch: the startup line reports the seeded window size (170 entries on
+  v1.1.0+ — a 90-entry report means stale code in RAM, restart); the 5-min
+  heartbeat shows window edges + estimated beacon-clock drift; the poll
+  logs every Eddystone payload it saw that did NOT match (EID hex + window
+  front) — those lines are the smoking gun for a match-layer fault (tag in
+  range yet "away"); IN RANGE / OUT OF RANGE flips are logged at INFO with
+  the reason (timeout vs unavailable-event) and the window state.
 - All datetimes are **timezone-aware UTC** (required by the TIMESTAMP sensor
   and for correct EID epoch computation). Do not introduce naive `datetime.now()`.

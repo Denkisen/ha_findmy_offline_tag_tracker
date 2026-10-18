@@ -69,7 +69,18 @@ _LOGGER = logging.getLogger(__name__)
 # How often we re-evaluate the presence timeout (seconds).
 PRESENCE_CHECK_INTERVAL = timedelta(seconds=10)
 
+# How often we emit a debug-level state snapshot (diagnostics).
+DIAGNOSTIC_HEARTBEAT_INTERVAL = timedelta(minutes=5)
+
 Listener = Callable[[], None]
+
+
+def _format_drift(drift: Optional[tuple[float, float]]) -> str:
+    """Render a beacon-clock drift range for log lines."""
+    if drift is None:
+        return "n/a (tag not matched yet)"
+    low, high = drift
+    return f"{low:.0f}..{high:.0f} s ahead of wall time"
 
 
 class TagCoordinator:
@@ -131,11 +142,24 @@ class TagCoordinator:
         self._rssi = service_info.rssi
         address = service_info.address
         if address != self._address:
+            _LOGGER.debug(
+                "%s: tag seen at new address %s (was %s), re-pointing "
+                "per-address trackers",
+                self._name,
+                address,
+                self._address,
+            )
             self._address = address
             self._async_track_address_unavailable(address)
             self._async_track_address_advertisements(address)
         if not self._is_home:
             self._is_home = True
+            _LOGGER.info(
+                "%s: tag IN RANGE (address %s, RSSI %s)",
+                self._name,
+                address,
+                service_info.rssi,
+            )
         self._notify()
 
     @callback
@@ -181,7 +205,13 @@ class TagCoordinator:
             if _service_info.address != self._address:
                 return  # stale: the tag already moved to a newer address
             self._is_home = False
-            _LOGGER.debug("%s: address %s unavailable, marking out of range", self._name, address)
+            _LOGGER.info(
+                "%s: tag OUT OF RANGE (reason: address %s stopped advertising; "
+                "beacon clock %s)",
+                self._name,
+                address,
+                _format_drift(self.tracker.estimated_clock_drift()),
+            )
             self._notify()
 
         self._unsub_unavailable = async_track_unavailable(
@@ -223,6 +253,14 @@ class TagCoordinator:
     @callback
     def async_start(self) -> CALLBACK_TYPE:
         """Register the Bluetooth callback, presence timer and discovery poll."""
+        _LOGGER.info(
+            "%s: coordinator started; EID window seeded with %d entries "
+            "(front %s, back %s)",
+            self._name,
+            self.tracker.window_entries,
+            self.tracker.window_front,
+            self.tracker.window_back,
+        )
         self._on_stop.append(
             async_register_callback(
                 self.hass,
@@ -245,6 +283,14 @@ class TagCoordinator:
                 self.hass,
                 self._async_poll_discovered,
                 PRESENCE_POLL_INTERVAL,
+            )
+        )
+        # Debug-level state snapshot for on-box diagnostics.
+        self._on_stop.append(
+            async_track_time_interval(
+                self.hass,
+                self._async_log_heartbeat,
+                DIAGNOSTIC_HEARTBEAT_INTERVAL,
             )
         )
         return self.async_stop
@@ -273,14 +319,46 @@ class TagCoordinator:
         )
         elapsed = (datetime.now(timezone.utc) - self._last_seen).total_seconds()
         if elapsed > timeout:
-            _LOGGER.debug(
-                "%s: no advertisement for %ss, marking out of range",
+            _LOGGER.info(
+                "%s: tag OUT OF RANGE (reason: no matching advertisement for %ss; "
+                "window front %s, entries %d, beacon clock %s)",
                 self._name,
                 int(elapsed),
+                self.tracker.window_front,
+                self.tracker.window_entries,
+                _format_drift(self.tracker.estimated_clock_drift()),
             )
             self._is_home = False
             self._rssi = None  # RSSI is a property of a fresh ad; stale value is misleading
             self._notify()
+
+    @callback
+    def _async_log_heartbeat(self, _now: datetime) -> None:
+        """Emit a debug-level snapshot of the tracker's state.
+
+        Enabled by ``logger: {custom_components.ha_findmy_offline_tag_tracker:
+        debug}`` — this is the primary tool for on-box diagnostics: it shows
+        the window edges, whether the tag has ever been matched, and the
+        estimated beacon-clock drift, so a match-layer fault (window outrun
+        by a drifting beacon clock) is visible in the logs directly.
+        """
+        now = datetime.now(timezone.utc)
+        elapsed = (
+            (now - self._last_seen).total_seconds() if self._last_seen else None
+        )
+        _LOGGER.debug(
+            "%s: heartbeat: in_range=%s, last_seen=%s, rssi=%s, address=%s, "
+            "window=%d entries (front %s, back %s), beacon clock %s",
+            self._name,
+            self._is_home,
+            f"{elapsed:.0f}s ago" if elapsed is not None else "never",
+            self._rssi,
+            self._address,
+            self.tracker.window_entries,
+            self.tracker.window_front,
+            self.tracker.window_back,
+            _format_drift(self.tracker.estimated_clock_drift()),
+        )
 
     @callback
     def _async_poll_discovered(self, _now: datetime) -> None:
@@ -329,6 +407,25 @@ class TagCoordinator:
                 if adv.rssi is not None and adv.rssi == -127:
                     continue  # BlueZ placeholder for a paired-but-absent device
                 if not self.tracker.match(payload, now):
+                    # This is the primary diagnostic line: an Eddystone
+                    # payload that the scanner saw but the EID window did not
+                    # accept. If the tag is physically in range yet the entity
+                    # says "away", these lines (with the window front and the
+                    # estimated beacon-clock drift) show exactly why.
+                    eid = payload[1 : 1 + self.tracker.beacon.eid_length]
+                    _LOGGER.debug(
+                        "%s: poll saw Eddystone payload at %s (RSSI %s, EID "
+                        "%s) that did NOT match the tag's EID window (front "
+                        "%s, back %s, entries %d, beacon clock %s)",
+                        self._name,
+                        address,
+                        adv.rssi,
+                        eid.hex(),
+                        self.tracker.window_front,
+                        self.tracker.window_back,
+                        self.tracker.window_entries,
+                        _format_drift(self.tracker.estimated_clock_drift()),
+                    )
                     continue
                 _LOGGER.debug(
                     "%s: poll matched tag at %s (RSSI %s)",
@@ -345,10 +442,25 @@ class TagCoordinator:
         if rssi is not None:
             self._rssi = rssi
         if address != self._address:
+            if self._address is not None:
+                _LOGGER.debug(
+                    "%s: poll re-learned tag at new address %s (was %s), "
+                    "re-pointing per-address trackers",
+                    self._name,
+                    address,
+                    self._address,
+                )
             self._address = address
             self._async_track_address_unavailable(address)
             self._async_track_address_advertisements(address)
-        self._is_home = True
+        if not self._is_home:
+            self._is_home = True
+            _LOGGER.info(
+                "%s: tag IN RANGE (via discovery poll, address %s, RSSI %s)",
+                self._name,
+                address,
+                rssi,
+            )
         self._notify()
 
     # ------------------------------------------------------------------ #
